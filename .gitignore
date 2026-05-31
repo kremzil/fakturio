@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dev.db
+dev.db-journal
+test.db
+test.db-journal
+prisma/*.db
+prisma/*.db-journal
+storage/uploads/*
+!storage/uploads/.gitkeep
+.env.local
+coverage/
+.vite/
+tmp/
+dev-server.log
