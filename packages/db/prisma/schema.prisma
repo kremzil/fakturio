@@ -1,0 +1,301 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MembershipRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum CaseStatus {
+  RECEIVED
+  PARSED
+  MANUAL_REVIEW_REQUIRED
+  WAITING_FOR_DUE_DATE
+  DUE_SOON
+  OVERDUE
+  EMAIL_REMINDER_1_SENT
+  EMAIL_REMINDER_2_SENT
+  PAYMENT_REQUEST_SENT
+  CALL_SCHEDULED
+  CALL_COMPLETED
+  PAYMENT_PROMISED
+  INSTALLMENT_REQUESTED
+  INSTALLMENT_PLAN_SENT
+  INSTALLMENT_ACTIVE
+  INSTALLMENT_BROKEN
+  FINAL_NOTICE_SENT
+  READY_FOR_LEGAL_ACTION
+  CLOSED_PAID
+  CLOSED_CANCELLED
+  CLOSED_UNRESOLVED
+}
+
+enum CaseEventActorType {
+  SYSTEM
+  USER
+  AI
+  WORKFLOW
+  DEBTOR
+  EMAIL_PROVIDER
+}
+
+enum CommunicationDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum CommunicationChannel {
+  EMAIL
+  VOICE
+  MANUAL_NOTE
+}
+
+enum CommunicationStatus {
+  DRAFT
+  SENT
+  RECEIVED
+  FAILED
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  memberships   Membership[]
+  caseEvents    CaseEvent[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+}
+
+model Organization {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  memberships Membership[]
+  customers   Customer[]
+  debtors     Debtor[]
+  cases       Case[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+model Membership {
+  id             String         @id @default(cuid())
+  organizationId String
+  userId         String
+  role           MembershipRole @default(MEMBER)
+  createdAt      DateTime       @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+model Customer {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  email          String?
+  ico            String?
+  dic            String?
+  icDph          String?
+  address        String?
+  cases          Case[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([email])
+}
+
+model Debtor {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  email          String?
+  ico            String?
+  dic            String?
+  icDph          String?
+  address        String?
+  cases          Case[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([email])
+  @@index([ico])
+}
+
+model Case {
+  id             String     @id @default(cuid())
+  organizationId String
+  customerId     String?
+  debtorId       String?
+  status         CaseStatus @default(RECEIVED)
+  workflowId     String?
+
+  invoiceNumber String?
+  issueDate     DateTime?
+  dueDate       DateTime?
+  amountTotal   Decimal?   @db.Decimal(12, 2)
+  currency      String?
+
+  supplierSnapshot Json?
+  debtorSnapshot   Json?
+  paymentSnapshot  Json?
+  subjectNote      String?
+  aiConfidence     Float?
+  warnings         String[] @default([])
+  rawAiResult      Json?
+
+  confirmedByUserId String?
+  confirmedAt       DateTime?
+  closedAt          DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customer         Customer?         @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  debtor           Debtor?           @relation(fields: [debtorId], references: [id], onDelete: SetNull)
+  invoiceDocuments InvoiceDocument[]
+  events           CaseEvent[]
+  communications   Communication[]
+  paymentPromises  PaymentPromise[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([invoiceNumber])
+  @@index([dueDate])
+  @@index([createdAt])
+}
+
+model InvoiceDocument {
+  id             String   @id @default(cuid())
+  caseId         String
+  storageBucket  String
+  storageKey     String
+  originalName   String
+  mimeType       String
+  sizeBytes      Int
+  sha256         String?
+  createdAt      DateTime @default(now())
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@unique([storageBucket, storageKey])
+}
+
+model CaseEvent {
+  id        String             @id @default(cuid())
+  caseId    String
+  actorType CaseEventActorType
+  actorId   String?
+  type      String
+  note      String?
+  payload   Json?
+  createdAt DateTime           @default(now())
+
+  case  Case  @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([caseId])
+  @@index([type])
+  @@index([createdAt])
+}
+
+model Communication {
+  id             String                 @id @default(cuid())
+  caseId         String
+  direction      CommunicationDirection
+  channel        CommunicationChannel
+  status         CommunicationStatus    @default(DRAFT)
+  provider       String?
+  providerId     String?
+  fromAddress    String?
+  toAddress      String?
+  subject        String?
+  textBody       String?
+  htmlBody       String?
+  rawPayload     Json?
+  aiClassification Json?
+  sentAt         DateTime?
+  receivedAt     DateTime?
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@index([direction])
+  @@index([channel])
+  @@index([createdAt])
+}
+
+model PaymentPromise {
+  id           String   @id @default(cuid())
+  caseId       String
+  promisedDate DateTime
+  amount       Decimal? @db.Decimal(12, 2)
+  currency     String?
+  note         String?
+  fulfilledAt  DateTime?
+  brokenAt     DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@index([promisedDate])
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@fakturio/worker",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@fakturio/db": "0.2.0",
+    "@fakturio/email": "0.2.0",
+    "@fakturio/shared": "0.2.0",
+    "@fakturio/workflows": "0.2.0"
+  }
+}

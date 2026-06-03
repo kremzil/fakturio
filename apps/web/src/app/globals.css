@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --font-display: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-sans: "Aptos", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(90deg, rgba(23, 32, 27, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(23, 32, 27, 0.035) 1px, transparent 1px),
+    #f6f3ed;
+  background-size: 28px 28px;
+  color: #17201b;
+  font-family: var(--font-sans);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: #dff07b;
+  color: #17201b;
+}

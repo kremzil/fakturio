@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.next/
+next-env.d.ts
+*.tsbuildinfo
 dev.db
 dev.db-journal
 test.db
@@ -11,5 +14,9 @@ storage/uploads/*
 .env.local
 coverage/
 .vite/
+.playwright-mcp/
 tmp/
 dev-server.log
+.env
+packages/db/prisma/*.db
+packages/db/prisma/*.db-journal
