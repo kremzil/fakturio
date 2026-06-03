@@ -10,6 +10,7 @@
       "@fakturio/ai": ["../../packages/ai/src/index.ts"],
       "@fakturio/db": ["../../packages/db/src/index.ts"],
       "@fakturio/email": ["../../packages/email/src/index.ts"],
+      "@fakturio/intake": ["../../packages/intake/src/index.ts"],
       "@fakturio/shared": ["../../packages/shared/src/index.ts"],
       "@fakturio/storage": ["../../packages/storage/src/index.ts"],
       "@fakturio/workflows": ["../../packages/workflows/src/index.ts"]

@@ -11,6 +11,8 @@ export const partySchema = z.object({
   address: nullableText
 });
 
+export type Party = z.infer<typeof partySchema>;
+
 export const paymentFieldsSchema = z.object({
   iban: nullableText,
   variableSymbol: nullableText,

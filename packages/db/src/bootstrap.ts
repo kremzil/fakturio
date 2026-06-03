@@ -39,5 +39,15 @@ export async function ensureLocalBootstrap() {
     }
   });
 
+  await prisma.emailIntakeAddress.upsert({
+    where: { address: "invoices@fakturio.local" },
+    update: { organizationId: organization.id, active: true, provider: "fixture" },
+    create: {
+      organizationId: organization.id,
+      address: "invoices@fakturio.local",
+      provider: "fixture"
+    }
+  });
+
   return { organization, user };
 }

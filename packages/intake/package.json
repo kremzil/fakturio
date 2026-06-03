@@ -1,0 +1,16 @@
+{
+  "name": "@fakturio/intake",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fakturio/ai": "0.2.0",
+    "@fakturio/db": "0.2.0",
+    "@fakturio/email": "0.2.0",
+    "@fakturio/shared": "0.2.0",
+    "@fakturio/storage": "0.2.0"
+  }
+}

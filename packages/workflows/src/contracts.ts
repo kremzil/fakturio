@@ -16,11 +16,14 @@ export type CaseSnapshot = {
   currency: string | null;
   debtorName: string | null;
   debtorEmail: string | null;
+  customerEmail: string | null;
+  organizationName: string | null;
 };
 
 export interface CaseWorkflowActivities {
   loadCaseSnapshot(input: { caseId: string }): Promise<CaseSnapshot>;
   recordWorkflowEvent(input: { caseId: string; type: string; note?: string }): Promise<void>;
+  sendPaymentCheckEmail(input: { caseId: string }): Promise<void>;
   sendReminderEmail(input: { caseId: string; reminderLevel: 1 | 2 | "payment-request" | "final" }): Promise<void>;
   markCaseOverdue(input: { caseId: string }): Promise<void>;
 }

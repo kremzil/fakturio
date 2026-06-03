@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { CASE_EVENT_TYPES, validateInvoiceForWorkflow } from "@fakturio/shared";
 import { ensureLocalBootstrap, prisma } from "@fakturio/db";
 import { toDashboardCase } from "@/lib/case-data";
+import { requestCaseWorkflowStart } from "@/lib/workflow-client";
 
 export const runtime = "nodejs";
 
@@ -54,6 +55,8 @@ export async function POST(_: Request, context: { params: Promise<{ caseId: stri
       events: { orderBy: { createdAt: "desc" }, take: 6 }
     }
   });
+
+  await requestCaseWorkflowStart({ caseId: updated.id, organizationId: updated.organizationId });
 
   return NextResponse.json({ case: toDashboardCase(updated) });
 }

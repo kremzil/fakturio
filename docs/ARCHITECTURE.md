@@ -9,6 +9,7 @@ apps/
 packages/
   db/        Prisma schema and DB client
   ai/        OpenAI provider and AI contracts
+  intake/    shared invoice intake pipeline for upload and email
   workflows/ Temporal workflow contracts
   email/     SES/Mailpit provider abstraction
   storage/   S3/MinIO provider abstraction
@@ -18,13 +19,35 @@ packages/
 ## Data Flow
 
 ```text
-invoice file
+UI upload or inbound email
   -> apps/web route handler
+  -> inbound email address resolves Organization when the source is email
+  -> packages/intake normalizes source as UPLOAD or EMAIL
   -> packages/storage stores original file
   -> packages/ai extracts structured invoice data
-  -> packages/db creates Case, InvoiceDocument, CaseEvent
+  -> packages/intake resolves Customer/Debtor within Organization
+  -> packages/db creates Case, InvoiceDocument, Communication when email, CaseEvent
   -> apps/worker later runs CaseWorkflow
 ```
+
+Email intake stores inbound messages as `Communication` records. Each supported PDF/image attachment becomes an `InvoiceDocument` and follows the same parser/review/confirm pipeline as manual upload. Unsupported email attachments are recorded as skipped metadata; emails without supported attachments create a `MANUAL_REVIEW_REQUIRED` case.
+
+## Organization And Counterparty Matching
+
+`Organization` is the customer account in FAKTURIO. Inbound email routing is represented by `EmailIntakeAddress`, so addresses like `invoices@fakturio.local` or future customer aliases can point to the correct organization before parsing starts.
+
+Counterparties are scoped to an organization. `Debtor` is the debtor/customer's counterparty on the invoice. `Customer` currently stores the parsed supplier snapshot as a structured organization-scoped party; this may later collapse into an organization legal profile.
+
+`packages/intake` resolves parsed parties before attaching a case:
+
+1. IČO
+2. IČ DPH
+3. DIČ
+4. email
+5. normalized name + normalized address
+6. unique normalized name within the organization
+
+The resolver updates known fields without overwriting existing identifiers with empty values. Match metadata is written to the parse event payload for auditability.
 
 ## Provider Targets
 
@@ -36,3 +59,19 @@ invoice file
 ## State Ownership
 
 The database is the source of truth. Temporal owns durable waiting and scheduled workflow execution. AI never owns state transitions; it returns structured data used by backend validation and workflow rules.
+
+Temporal uses separate local databases (`temporal`, `temporal_visibility`) from the application database (`fakturio`) so Prisma migrations only manage application tables.
+
+## Payment Check Workflow
+
+Confirming a reviewed invoice sets the case to `WAITING_FOR_DUE_DATE` and records a workflow start request. The worker scans confirmed cases without `workflowId`, starts `caseWorkflow`, and stores the deterministic workflow id `case-{caseId}`.
+
+`caseWorkflow` waits until the invoice due date. On that date, if the case is still waiting, the worker sends a payment-check email to the customer account user through `EmailProvider`:
+
+- `EMAIL_DRIVER=mailpit` locally writes to Mailpit SMTP.
+- `EMAIL_DRIVER=ses` uses Amazon SES in production.
+
+The email contains two action links:
+
+- `/api/cases/:caseId/payment-check/paid` closes the case as `CLOSED_PAID`.
+- `/api/cases/:caseId/payment-check/not-paid` marks the case `OVERDUE` and records that collection can continue.

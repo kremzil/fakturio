@@ -23,6 +23,8 @@ services:
     environment:
       DB: postgres12
       DB_PORT: 5432
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
       POSTGRES_USER: fakturio
       POSTGRES_PWD: fakturio
       POSTGRES_SEEDS: postgres

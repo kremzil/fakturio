@@ -64,6 +64,11 @@ enum CommunicationStatus {
   FAILED
 }
 
+enum IntakeSource {
+  UPLOAD
+  EMAIL
+}
+
 model User {
   id            String    @id @default(cuid())
   name          String?
@@ -116,11 +121,27 @@ model Organization {
   name        String
   slug        String       @unique
   memberships Membership[]
+  emailIntakeAddresses EmailIntakeAddress[]
   customers   Customer[]
   debtors     Debtor[]
   cases       Case[]
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
+}
+
+model EmailIntakeAddress {
+  id             String   @id @default(cuid())
+  organizationId String
+  address        String   @unique
+  provider       String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([active])
 }
 
 model Membership {
@@ -142,6 +163,8 @@ model Customer {
   organizationId String
   name           String
   email          String?
+  normalizedName String?
+  normalizedAddress String?
   ico            String?
   dic            String?
   icDph          String?
@@ -154,6 +177,11 @@ model Customer {
 
   @@index([organizationId])
   @@index([email])
+  @@index([normalizedName])
+  @@index([normalizedName, normalizedAddress])
+  @@index([ico])
+  @@index([dic])
+  @@index([icDph])
 }
 
 model Debtor {
@@ -161,6 +189,8 @@ model Debtor {
   organizationId String
   name           String
   email          String?
+  normalizedName String?
+  normalizedAddress String?
   ico            String?
   dic            String?
   icDph          String?
@@ -173,7 +203,11 @@ model Debtor {
 
   @@index([organizationId])
   @@index([email])
+  @@index([normalizedName])
+  @@index([normalizedName, normalizedAddress])
   @@index([ico])
+  @@index([dic])
+  @@index([icDph])
 }
 
 model Case {
@@ -182,6 +216,7 @@ model Case {
   customerId     String?
   debtorId       String?
   status         CaseStatus @default(RECEIVED)
+  sourceType     IntakeSource @default(UPLOAD)
   workflowId     String?
 
   invoiceNumber String?
@@ -213,6 +248,7 @@ model Case {
   paymentPromises  PaymentPromise[]
 
   @@index([organizationId])
+  @@index([sourceType])
   @@index([status])
   @@index([invoiceNumber])
   @@index([dueDate])
@@ -222,6 +258,8 @@ model Case {
 model InvoiceDocument {
   id             String   @id @default(cuid())
   caseId         String
+  communicationId String?
+  sourceType     IntakeSource @default(UPLOAD)
   storageBucket  String
   storageKey     String
   originalName   String
@@ -231,8 +269,11 @@ model InvoiceDocument {
   createdAt      DateTime @default(now())
 
   case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  communication Communication? @relation(fields: [communicationId], references: [id], onDelete: SetNull)
 
   @@index([caseId])
+  @@index([communicationId])
+  @@index([sourceType])
   @@unique([storageBucket, storageKey])
 }
 
@@ -275,6 +316,7 @@ model Communication {
   updatedAt      DateTime               @updatedAt
 
   case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  invoiceDocuments InvoiceDocument[]
 
   @@index([caseId])
   @@index([direction])

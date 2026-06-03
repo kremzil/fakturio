@@ -45,7 +45,46 @@ npm run dev
 - `apps/worker` содержит Temporal worker skeleton.
 - `packages/ai` содержит перенесённый OpenAI invoice parser.
 - `packages/db` содержит новую PostgreSQL Prisma schema.
+- `packages/intake` содержит общий pipeline приёма фактур из upload и email.
 - `packages/storage` и `packages/email` фиксируют S3/SES target через provider abstraction.
+
+## Текущий intake flow
+
+Фактура может попасть в систему двумя путями:
+
+- UI upload: `POST /api/cases/upload`
+- локальный email fixture: `POST /api/dev/email-inbound`
+
+Оба пути вызывают `InvoiceIntakeService`:
+
+```text
+source upload/email
+  -> email alias resolves Organization when source is email
+  -> StorageProvider.putObject()
+  -> AiProvider.extractInvoice()
+  -> resolve Customer/Debtor inside Organization
+  -> Case + InvoiceDocument + CaseEvent
+  -> human review
+  -> confirm
+  -> Temporal CaseWorkflow
+```
+
+Контрагенты не создаются каждый раз заново: `packages/intake` ищет существующего `Debtor` внутри `Organization` по IČO, IČ DPH, DIČ, email, нормализованному названию и адресу. Повторные фактуры одного должника должны попадать в одну карточку контрагента.
+
+После подтверждения фактуры case переходит в `WAITING_FOR_DUE_DATE`. Worker стартует Temporal workflow для подтверждённых case, ждёт дату splatnosti из фактуры и отправляет заказчику email с двумя действиями:
+
+- `Оплата поступила` -> case закрывается как `CLOSED_PAID`.
+- `Оплата не поступила` -> case переходит в `OVERDUE`, после чего могут начинаться следующие collection steps.
+
+Пример локального email fixture:
+
+```bash
+curl -X POST http://localhost:3000/api/dev/email-inbound \
+  -H "Content-Type: application/json" \
+  -d "{\"from\":\"sender@example.com\",\"subject\":\"Faktura\",\"attachments\":[{\"fileName\":\"invoice.pdf\",\"mimeType\":\"application/pdf\",\"base64\":\"...\"}]}"
+```
+
+`/api/dev/email-inbound` отключён в production. Production inbound/outbound email target: Amazon SES.
 
 ## Проверки
 

@@ -200,7 +200,10 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
               >
                 <div className="flex items-start justify-between gap-4">
                   <div>
-                    <div className="text-xs uppercase tracking-[0.16em] text-steel">{statusLabels[item.status] ?? item.status}</div>
+                    <div className="flex flex-wrap gap-2 text-xs uppercase tracking-[0.16em] text-steel">
+                      <span>{statusLabels[item.status] ?? item.status}</span>
+                      <span>{item.sourceType === "EMAIL" ? "Email" : "Upload"}</span>
+                    </div>
                     <div className="mt-1 text-lg font-semibold">{item.invoiceNumber ?? "Bez čísla faktúry"}</div>
                   </div>
                   <div className="rounded-md bg-ink px-2 py-1 text-xs text-paper">

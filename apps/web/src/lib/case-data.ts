@@ -4,6 +4,7 @@ import { ensureLocalBootstrap, prisma } from "@fakturio/db";
 export type DashboardCase = {
   id: string;
   status: string;
+  sourceType: "UPLOAD" | "EMAIL";
   invoiceNumber: string | null;
   supplierName: string | null;
   debtorName: string | null;
@@ -38,10 +39,24 @@ export async function getDashboardCases(): Promise<DashboardCase[]> {
   }
 }
 
+export async function getDashboardCaseById(caseId: string): Promise<DashboardCase | null> {
+  const item = await prisma.case.findUnique({
+    where: { id: caseId },
+    include: {
+      debtor: true,
+      invoiceDocuments: { orderBy: { createdAt: "desc" }, take: 1 },
+      events: { orderBy: { createdAt: "desc" }, take: 6 }
+    }
+  });
+
+  return item ? toDashboardCase(item) : null;
+}
+
 export const demoCases: DashboardCase[] = [
   {
     id: "demo-1",
     status: "WAITING_FOR_DUE_DATE",
+    sourceType: "UPLOAD",
     invoiceNumber: "52606 00029",
     supplierName: "Dodávateľ s.r.o.",
     debtorName: "Július Bačo",
@@ -62,6 +77,7 @@ export const demoCases: DashboardCase[] = [
   {
     id: "demo-2",
     status: "MANUAL_REVIEW_REQUIRED",
+    sourceType: "EMAIL",
     invoiceNumber: null,
     supplierName: null,
     debtorName: null,
@@ -92,6 +108,7 @@ export function toDashboardCase(
   return {
     id: item.id,
     status: item.status,
+    sourceType: item.sourceType,
     invoiceNumber: item.invoiceNumber,
     supplierName: stringFromRecord(supplierSnapshot, "name"),
     debtorName: item.debtor?.name ?? stringFromRecord(debtorSnapshot, "name"),

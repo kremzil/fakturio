@@ -1,6 +1,6 @@
 import { proxyActivities, sleep } from "@temporalio/workflow";
 import type { CaseWorkflowActivities, CaseWorkflowInput } from "./contracts";
-import { STANDARD_REMINDER_SCHEDULE, daysAfter } from "./schedules";
+import { startOfInvoiceDay } from "./schedules";
 
 const activities = proxyActivities<CaseWorkflowActivities>({
   startToCloseTimeout: "2 minutes",
@@ -27,18 +27,35 @@ export async function caseWorkflow(input: CaseWorkflowInput): Promise<void> {
     return;
   }
 
-  const now = Date.now();
-  const firstReminderAt = daysAfter(snapshot.dueDate, STANDARD_REMINDER_SCHEDULE.firstReminderDaysAfterDue);
-  if (firstReminderAt.getTime() > now) {
-    await sleep(firstReminderAt.getTime() - now);
+  if (snapshot.status !== "WAITING_FOR_DUE_DATE") {
+    await activities.recordWorkflowEvent({
+      caseId: input.caseId,
+      type: "WORKFLOW_WAITING",
+      note: `Workflow stopped because case status is ${snapshot.status}.`
+    });
+    return;
   }
 
-  await activities.markCaseOverdue({ caseId: input.caseId });
-  await activities.sendReminderEmail({ caseId: input.caseId, reminderLevel: 1 });
+  const dueAt = startOfInvoiceDay(snapshot.dueDate);
+  if (dueAt.getTime() > Date.now()) {
+    await sleep(dueAt.getTime() - Date.now());
+  }
+
+  const afterWait = await activities.loadCaseSnapshot({ caseId: input.caseId });
+  if (afterWait.status !== "WAITING_FOR_DUE_DATE") {
+    await activities.recordWorkflowEvent({
+      caseId: input.caseId,
+      type: "WORKFLOW_WAITING",
+      note: `Payment check skipped because case status is ${afterWait.status}.`
+    });
+    return;
+  }
+
+  await activities.sendPaymentCheckEmail({ caseId: input.caseId });
 
   await activities.recordWorkflowEvent({
     caseId: input.caseId,
     type: "WORKFLOW_WAITING",
-    note: "Bootstrap workflow sent first reminder. Later stages add the full escalation schedule."
+    note: "Payment check email sent to customer. Waiting for paid or not-paid confirmation."
   });
 }

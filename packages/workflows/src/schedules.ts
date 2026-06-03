@@ -17,3 +17,7 @@ export function daysAfter(dateIso: string, days: number): Date {
   date.setUTCDate(date.getUTCDate() + days);
   return date;
 }
+
+export function startOfInvoiceDay(dateIso: string): Date {
+  return new Date(`${dateIso.slice(0, 10)}T00:00:00.000Z`);
+}
