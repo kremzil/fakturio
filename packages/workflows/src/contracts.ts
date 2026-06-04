@@ -1,6 +1,10 @@
 import type { CaseStatus } from "@fakturio/shared";
 
 export const CASE_TASK_QUEUE = "fakturio-collection";
+export const CASE_ACTIVITY_START_TO_CLOSE_TIMEOUT_MS = 2 * 60 * 1000;
+export const PAYMENT_CHECK_SEND_LEASE_GRACE_MS = 30 * 1000;
+export const PAYMENT_CHECK_SEND_LEASE_MS =
+  CASE_ACTIVITY_START_TO_CLOSE_TIMEOUT_MS + PAYMENT_CHECK_SEND_LEASE_GRACE_MS;
 
 export type CaseWorkflowInput = {
   caseId: string;
@@ -21,9 +25,13 @@ export type CaseSnapshot = {
 };
 
 export interface CaseWorkflowActivities {
-  loadCaseSnapshot(input: { caseId: string }): Promise<CaseSnapshot>;
-  recordWorkflowEvent(input: { caseId: string; type: string; note?: string }): Promise<void>;
-  sendPaymentCheckEmail(input: { caseId: string }): Promise<void>;
-  sendReminderEmail(input: { caseId: string; reminderLevel: 1 | 2 | "payment-request" | "final" }): Promise<void>;
-  markCaseOverdue(input: { caseId: string }): Promise<void>;
+  loadCaseSnapshot(input: { caseId: string; organizationId: string }): Promise<CaseSnapshot>;
+  recordWorkflowEvent(input: { caseId: string; organizationId: string; type: string; note?: string }): Promise<void>;
+  sendPaymentCheckEmail(input: { caseId: string; organizationId: string }): Promise<void>;
+  sendReminderEmail(input: {
+    caseId: string;
+    organizationId: string;
+    reminderLevel: 1 | 2 | "payment-request" | "final";
+  }): Promise<void>;
+  markCaseOverdue(input: { caseId: string; organizationId: string }): Promise<void>;
 }

@@ -49,6 +49,12 @@ Counterparties are scoped to an organization. `Debtor` is the debtor/customer's 
 
 The resolver updates known fields without overwriting existing identifiers with empty values. Match metadata is written to the parse event payload for auditability.
 
+## Authentication And Tenant Boundary
+
+Auth.js resolves the authenticated user, while `requireSession()` resolves and verifies the active `Organization`. Production never falls back to the local bootstrap user, and the passwordless local Credentials provider is disabled outside development.
+
+All customer-facing case reads and mutations must include `organizationId`. Web routes use organization-scoped case helpers with a narrow mutation allowlist; Temporal activities receive both `caseId` and `organizationId` and verify the pair before side effects. A globally unique `caseId` is an identifier, not authorization.
+
 ## Provider Targets
 
 - StorageProvider: MinIO locally, AWS S3 in production.
@@ -75,3 +81,13 @@ The email contains two action links:
 
 - `/api/cases/:caseId/payment-check/paid` closes the case as `CLOSED_PAID`.
 - `/api/cases/:caseId/payment-check/not-paid` marks the case `OVERDUE` and records that collection can continue.
+
+The links carry time-limited HMAC tokens bound to the case, organization and action. `GET` only renders a read-only confirmation page so email scanners and link previews cannot mutate state. The transition is applied only by an explicit token-authorized `POST`, using an optimistic conditional update so concurrent/replayed actions cannot regress the case.
+
+Payment-check delivery uses `Communication` as a durable outbox:
+
+- `idempotencyKey` identifies one payment-check message for a case and due date.
+- An atomic `sendLeaseId` / `sendLeaseUntil` claim ensures only one concurrent activity calls the email provider.
+- Retry reclaim refreshes the stored recipient, body and action tokens before sending.
+- Marking the communication `SENT` and recording the audit `CaseEvent` happen in one transaction.
+- Activity timeout and lease TTL are shared workflow constants; the lease includes a grace interval beyond the Temporal timeout.

@@ -76,6 +76,10 @@ source upload/email
 - `Оплата поступила` -> case закрывается как `CLOSED_PAID`.
 - `Оплата не поступила` -> case переходит в `OVERDUE`, после чего могут начинаться следующие collection steps.
 
+Ссылки подписываются отдельным HMAC-секретом и имеют TTL. Открытие ссылки через `GET` показывает read-only страницу подтверждения и не меняет case; переход состояния выполняется только после явного `POST`. Worker использует `Communication` как outbox с idempotency key и атомарным send lease, чтобы параллельные Temporal activity не отправляли одно письмо одновременно.
+
+Доступ dashboard/API к case всегда ограничивается активной `Organization`. В production локальный Credentials provider и fallback на `local-user` отключены.
+
 Пример локального email fixture:
 
 ```bash
@@ -90,5 +94,6 @@ curl -X POST http://localhost:3000/api/dev/email-inbound \
 
 ```bash
 npm test
+npm run test:integration
 npm run build
 ```

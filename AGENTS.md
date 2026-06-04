@@ -10,6 +10,7 @@ The hard product boundary: AI may extract, classify, draft, summarize, and recom
 - `apps/worker`: Temporal worker for durable collection workflows.
 - `packages/db`: Prisma schema, migrations, and DB client.
 - `packages/ai`: OpenAI provider and structured output schemas.
+- `packages/intake`: shared invoice intake pipeline, email routing and organization-scoped counterparty matching.
 - `packages/workflows`: Temporal workflow contracts and deterministic workflow code.
 - `packages/email`: email provider abstraction; local fixtures/Mailpit, production Amazon SES.
 - `packages/storage`: storage provider abstraction; local MinIO, production AWS S3.
@@ -32,8 +33,13 @@ Next.js runs at `http://localhost:3000`. Temporal UI runs at `http://localhost:8
 - Use PostgreSQL Prisma migrations for schema changes.
 - Add or update tests for parser, status transitions, route handlers, workflow activities, storage/email contracts, and validation.
 - Preserve auditability: every meaningful automated or user action should create a `CaseEvent`.
+- Scope every customer-facing case read and mutation to the active `Organization`; never authorize by globally unique `caseId` alone.
+- Keep invoice intake source-agnostic: upload and email paths should flow through `InvoiceIntakeService`.
+- Match counterparties within an `Organization` before creating new `Debtor`/`Customer` records.
 - Use provider interfaces for OpenAI, S3, SES, and Temporal activities.
 - Keep Temporal workflow code deterministic; perform side effects only in activities.
+- Treat email activities as retryable side effects: use durable idempotency keys and an atomic send lease before calling a provider.
+- Public email action links must be signed, time-limited, read-only on GET, and mutate only after an explicit POST.
 - Before using Next.js APIs, consult the official Next.js docs/MCP for the current version.
 
 ## Local Defaults

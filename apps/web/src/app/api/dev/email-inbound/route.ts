@@ -44,11 +44,12 @@ export async function POST(request: Request) {
 
   const { organization } = await ensureLocalBootstrap();
   const route = await resolveOrganizationForInboundEmail(email);
+  const organizationId = route?.organizationId ?? organization.id;
   const result = await new InvoiceIntakeService().createFromEmail({
-    organizationId: route?.organizationId ?? organization.id,
+    organizationId,
     email
   });
-  const cases = await Promise.all(result.cases.map((item) => getDashboardCaseById(item.caseId)));
+  const cases = await Promise.all(result.cases.map((item) => getDashboardCaseById(item.caseId, organizationId)));
 
   return NextResponse.json({
     cases: cases.filter(Boolean),

@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
-import { ensureLocalBootstrap } from "@fakturio/db";
 import { InvoiceIntakeService } from "@fakturio/intake";
 import { MAX_INVOICE_UPLOAD_BYTES, isAcceptedInvoiceMimeType } from "@fakturio/shared";
 import { getDashboardCaseById } from "@/lib/case-data";
+import { httpErrorResponse, requireSession } from "@/lib/session";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
+    const { organizationId, userId } = await requireSession();
+
     const formData = await request.formData();
     const file = formData.get("file");
     if (!(file instanceof File)) {
@@ -22,22 +24,18 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Maximálna veľkosť súboru je 20 MB." }, { status: 413 });
     }
 
-    const { organization, user } = await ensureLocalBootstrap();
     const intake = new InvoiceIntakeService();
     const result = await intake.createFromUpload({
-      organizationId: organization.id,
-      userId: user.id,
+      organizationId,
+      userId,
       fileName: file.name,
       mimeType: file.type,
       bytes: new Uint8Array(await file.arrayBuffer())
     });
-    const dashboardCase = await getDashboardCaseById(result.caseId);
+    const dashboardCase = await getDashboardCaseById(result.caseId, organizationId);
 
     return NextResponse.json({ case: dashboardCase, parseError: result.parseError }, { status: 201 });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Nahratie faktúry zlyhalo." },
-      { status: 500 }
-    );
+    return httpErrorResponse(error);
   }
 }

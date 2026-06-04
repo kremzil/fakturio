@@ -301,6 +301,9 @@ model Communication {
   direction      CommunicationDirection
   channel        CommunicationChannel
   status         CommunicationStatus    @default(DRAFT)
+  idempotencyKey String?                @unique
+  sendLeaseId    String?
+  sendLeaseUntil DateTime?
   provider       String?
   providerId     String?
   fromAddress    String?
@@ -321,6 +324,7 @@ model Communication {
   @@index([caseId])
   @@index([direction])
   @@index([channel])
+  @@index([sendLeaseUntil])
   @@index([createdAt])
 }
 

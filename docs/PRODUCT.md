@@ -9,23 +9,25 @@ The system may automate standard payment-control communication. It must not perf
 ## Core Layers
 
 - Invoice Intake: email or upload, original file storage, AI extraction, validation, manual review.
-- Payment Monitoring: wait until due date, allow manual paid/cancelled updates, later add automated status checks.
+- Payment Monitoring: wait until due date, ask the customer whether payment arrived, close paid cases or continue collection when unpaid.
 - Debtor Communication: predefined reminder workflow, reply classification, timeline.
 - Customer Dashboard: cases, overdue invoices, promises, communications, package export.
 
 ## MVP Scope On Target Stack
 
-- Upload invoice and parse it through OpenAI.
+- Upload invoice or receive it through email intake and parse it through OpenAI.
 - Create a `Case` and `InvoiceDocument`.
+- Resolve the customer account from inbound email aliases.
+- Match repeat debtors/counterparties inside the customer organization.
 - Review parsed fields.
 - Confirm case for payment monitoring.
-- Mark paid/cancelled manually.
+- Wait until invoice due date and email the customer with paid/not-paid actions.
+- Close paid cases or mark unpaid cases as overdue.
 - Store all actions as `CaseEvent`.
 - Provide provider boundaries for S3, SES and Temporal.
 
 ## Later Scope
 
-- Inbound SES email intake.
 - Full reminder workflow.
 - Installment plans.
 - Voice-call adapter, Twilio first.

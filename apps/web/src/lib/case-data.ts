@@ -1,5 +1,5 @@
 import type { Case, CaseEvent, Debtor, InvoiceDocument } from "@prisma/client";
-import { ensureLocalBootstrap, prisma } from "@fakturio/db";
+import { getCaseForOrg, listCasesForOrg } from "./case-access";
 
 export type DashboardCase = {
   id: string;
@@ -20,10 +20,9 @@ export type DashboardCase = {
   events: Array<{ id: string; type: string; note: string | null; createdAt: string }>;
 };
 
-export async function getDashboardCases(): Promise<DashboardCase[]> {
+export async function getDashboardCases(organizationId: string): Promise<DashboardCase[]> {
   try {
-    await ensureLocalBootstrap();
-    const cases = await prisma.case.findMany({
+    const cases = await listCasesForOrg(organizationId, {
       orderBy: { createdAt: "desc" },
       take: 25,
       include: {
@@ -34,19 +33,21 @@ export async function getDashboardCases(): Promise<DashboardCase[]> {
     });
 
     return cases.map(toDashboardCase);
-  } catch {
+  } catch (error) {
+    // In development the dashboard should still render without Docker infra/migrations.
+    // In production a data-layer failure must surface, never be masked with demo data.
+    if (process.env.NODE_ENV === "production") {
+      throw error;
+    }
     return demoCases;
   }
 }
 
-export async function getDashboardCaseById(caseId: string): Promise<DashboardCase | null> {
-  const item = await prisma.case.findUnique({
-    where: { id: caseId },
-    include: {
-      debtor: true,
-      invoiceDocuments: { orderBy: { createdAt: "desc" }, take: 1 },
-      events: { orderBy: { createdAt: "desc" }, take: 6 }
-    }
+export async function getDashboardCaseById(caseId: string, organizationId: string): Promise<DashboardCase | null> {
+  const item = await getCaseForOrg(caseId, organizationId, {
+    debtor: true,
+    invoiceDocuments: { orderBy: { createdAt: "desc" }, take: 1 },
+    events: { orderBy: { createdAt: "desc" }, take: 6 }
   });
 
   return item ? toDashboardCase(item) : null;
