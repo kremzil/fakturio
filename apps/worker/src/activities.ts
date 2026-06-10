@@ -195,6 +195,7 @@ export const activities: CaseWorkflowActivities = {
           status: "SENT",
           provider: email.provider,
           providerId: email.providerId,
+          messageId: normalizeMessageId(email.providerId),
           sentAt: new Date(),
           sendLeaseId: null,
           sendLeaseUntil: null
@@ -347,6 +348,11 @@ function escapeHtml(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function normalizeMessageId(value: string | null | undefined): string | null {
+  const normalized = value?.trim().replace(/^<|>$/g, "").toLowerCase();
+  return normalized || null;
 }
 
 function assertCaseOrganization(caseId: string, actualOrganizationId: string, expectedOrganizationId: string): void {

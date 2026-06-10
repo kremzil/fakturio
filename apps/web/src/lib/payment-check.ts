@@ -7,6 +7,7 @@ import {
   verifyPaymentCheckToken
 } from "@fakturio/shared";
 import { prisma } from "@fakturio/db";
+import { CASE_STATE_CHANGED_COMMAND } from "@fakturio/workflows";
 
 /**
  * Public, token-authorized payment-check flow used from links inside customer emails.
@@ -132,7 +133,23 @@ async function applyPaymentCheck(caseId: string, organizationId: string, action:
         return { outcome: "RETRY" } as const;
       }
 
-      await tx.caseEvent.createMany({ data: eventsForAction(caseId, action) });
+      const auditEvents = eventsForAction(caseId, action);
+      const transitionEvent = await tx.caseEvent.create({ data: auditEvents[0] });
+      if (auditEvents.length > 1) {
+        await tx.caseEvent.createMany({ data: auditEvents.slice(1) });
+      }
+      await tx.workflowCommand.create({
+        data: {
+          caseId,
+          organizationId,
+          type: CASE_STATE_CHANGED_COMMAND,
+          idempotencyKey: `case-event:${transitionEvent.id}`,
+          payload: {
+            status: transition.nextStatus,
+            source: "PAYMENT_CHECK"
+          }
+        }
+      });
 
       return { outcome: "APPLIED", status: transition.nextStatus } as const;
     });

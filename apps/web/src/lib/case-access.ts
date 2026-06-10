@@ -1,5 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@fakturio/db";
+import { CASE_STATE_CHANGED_COMMAND } from "@fakturio/workflows";
+import type { CaseStatus } from "@fakturio/shared";
 
 /**
  * Organization-scoped data access for cases.
@@ -63,6 +65,53 @@ export async function updateCaseForOrg<Include extends Prisma.CaseInclude | unde
       // subset of Prisma's input, so the cast only re-widens to the driver's expected type.
       data: data as Prisma.CaseUpdateInput,
       include
+    });
+
+    return updated as Prisma.CaseGetPayload<{ include: Include }>;
+  });
+}
+
+export async function updateCaseForOrgAndEnqueueStateChange<
+  Include extends Prisma.CaseInclude | undefined = undefined
+>(
+  caseId: string,
+  organizationId: string,
+  data: CaseUpdateData,
+  command: { status: CaseStatus; idempotencyKey: string; source: string },
+  include?: Include
+): Promise<Prisma.CaseGetPayload<{ include: Include }> | null> {
+  assertNoOrganizationReassignment(data);
+
+  return prisma.$transaction(async (tx) => {
+    const owned = await tx.case.findFirst({
+      where: { id: caseId, organizationId },
+      select: { id: true }
+    });
+
+    if (!owned) {
+      return null;
+    }
+
+    await assertConnectedEntitiesInOrg(tx, organizationId, data);
+    const updated = await tx.case.update({
+      where: { id: caseId },
+      data: data as Prisma.CaseUpdateInput,
+      include
+    });
+
+    await tx.workflowCommand.upsert({
+      where: { idempotencyKey: command.idempotencyKey },
+      create: {
+        caseId,
+        organizationId,
+        type: CASE_STATE_CHANGED_COMMAND,
+        idempotencyKey: command.idempotencyKey,
+        payload: {
+          status: command.status,
+          source: command.source
+        }
+      },
+      update: {}
     });
 
     return updated as Prisma.CaseGetPayload<{ include: Include }>;

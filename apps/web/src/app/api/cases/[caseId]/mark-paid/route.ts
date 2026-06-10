@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { CASE_EVENT_TYPES } from "@fakturio/shared";
 import { toDashboardCase } from "@/lib/case-data";
-import { updateCaseForOrg } from "@/lib/case-access";
+import { updateCaseForOrgAndEnqueueStateChange } from "@/lib/case-access";
 import { httpErrorResponse, requireSession } from "@/lib/session";
 
 export const runtime = "nodejs";
@@ -11,7 +11,7 @@ export async function POST(_: Request, context: { params: Promise<{ caseId: stri
     const { caseId } = await context.params;
     const { organizationId, userId } = await requireSession();
 
-    const updated = await updateCaseForOrg(
+    const updated = await updateCaseForOrgAndEnqueueStateChange(
       caseId,
       organizationId,
       {
@@ -25,6 +25,11 @@ export async function POST(_: Request, context: { params: Promise<{ caseId: stri
             note: "Customer marked the case as paid."
           }
         }
+      },
+      {
+        status: "CLOSED_PAID",
+        idempotencyKey: `manual-paid:${caseId}`,
+        source: "DASHBOARD"
       },
       {
         debtor: true,

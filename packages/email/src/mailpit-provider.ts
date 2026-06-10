@@ -1,5 +1,6 @@
 import nodemailer from "nodemailer";
 import { EmailProvider, InboundEmail, SendEmailInput, SentEmailResult } from "./types";
+import { extractRawMimeInput, parseMimeEmail } from "./mime";
 
 export type MailpitEmailProviderOptions = {
   host: string;
@@ -20,6 +21,7 @@ export class MailpitEmailProvider implements EmailProvider {
   async sendEmail(input: SendEmailInput): Promise<SentEmailResult> {
     const result = await this.transport.sendMail({
       from: input.from,
+      replyTo: input.replyTo,
       to: input.to,
       cc: input.cc,
       bcc: input.bcc,
@@ -35,17 +37,7 @@ export class MailpitEmailProvider implements EmailProvider {
   }
 
   async parseInbound(input: unknown): Promise<InboundEmail> {
-    return {
-      provider: "mailpit",
-      providerId: "mailpit-inbound-unparsed",
-      from: "",
-      to: [],
-      cc: [],
-      subject: null,
-      textBody: null,
-      htmlBody: null,
-      attachments: [],
-      raw: input
-    };
+    const { raw, providerId } = extractRawMimeInput(input);
+    return parseMimeEmail(raw, "mailpit", providerId);
   }
 }

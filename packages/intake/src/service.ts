@@ -72,6 +72,13 @@ export class InvoiceIntakeService {
 
     const cases: IntakeCaseResult[] = [];
     for (const attachment of acceptedAttachments) {
+      const idempotencyKey = inboundInvoiceIdempotencyKey(input.email, attachment);
+      const existing = await findExistingInboundCase(idempotencyKey);
+      if (existing) {
+        cases.push(existing);
+        continue;
+      }
+
       cases.push(
         await this.createCaseFromFile({
           organizationId: input.organizationId,
@@ -79,7 +86,8 @@ export class InvoiceIntakeService {
           sourceType: "EMAIL",
           actor: { actorType: "EMAIL_PROVIDER" },
           caseCreatedNote: `Inbound email ${input.email.providerId} attachment ${attachment.fileName}.`,
-          email: input.email
+          email: input.email,
+          communicationIdempotencyKey: idempotencyKey
         })
       );
     }
@@ -94,6 +102,7 @@ export class InvoiceIntakeService {
     actor: IntakeActor;
     caseCreatedNote: string;
     email?: InboundEmail;
+    communicationIdempotencyKey?: string;
   }): Promise<IntakeCaseResult> {
     const collectionCase = await prisma.case.create({
       data: {
@@ -111,31 +120,63 @@ export class InvoiceIntakeService {
       }
     });
 
-    const communication = input.email
-      ? await createInboundCommunication(collectionCase.id, input.email)
-      : null;
+    let communication = null;
+    if (input.email) {
+      try {
+        communication = await createInboundCommunication(
+          collectionCase.id,
+          input.email,
+          undefined,
+          input.communicationIdempotencyKey
+        );
+      } catch (error) {
+        if (!isUniqueConstraintViolation(error) || !input.communicationIdempotencyKey) {
+          throw error;
+        }
 
-    const stored = await this.deps.storage.putObject({
-      organizationId: input.organizationId,
-      caseId: collectionCase.id,
-      fileName: input.file.fileName,
-      contentType: input.file.mimeType,
-      body: input.file.bytes
-    });
-
-    await prisma.invoiceDocument.create({
-      data: {
-        caseId: collectionCase.id,
-        communicationId: communication?.id,
-        sourceType: input.sourceType,
-        storageBucket: stored.bucket,
-        storageKey: stored.key,
-        originalName: input.file.fileName,
-        mimeType: input.file.mimeType,
-        sizeBytes: stored.sizeBytes,
-        sha256: hashBytes(input.file.bytes)
+        await prisma.case.delete({ where: { id: collectionCase.id } });
+        const existing = await findExistingInboundCase(
+          input.communicationIdempotencyKey
+        );
+        if (existing) {
+          return existing;
+        }
+        throw error;
       }
-    });
+    }
+
+    let stored: Awaited<ReturnType<InvoiceIntakeDependencies["storage"]["putObject"]>> | null = null;
+    try {
+      stored = await this.deps.storage.putObject({
+        organizationId: input.organizationId,
+        caseId: collectionCase.id,
+        fileName: input.file.fileName,
+        contentType: input.file.mimeType,
+        body: input.file.bytes
+      });
+
+      await prisma.invoiceDocument.create({
+        data: {
+          caseId: collectionCase.id,
+          communicationId: communication?.id,
+          sourceType: input.sourceType,
+          storageBucket: stored.bucket,
+          storageKey: stored.key,
+          originalName: input.file.fileName,
+          mimeType: input.file.mimeType,
+          sizeBytes: stored.sizeBytes,
+          sha256: hashBytes(input.file.bytes)
+        }
+      });
+    } catch (error) {
+      if (stored) {
+        await this.deps.storage
+          .deleteObject({ bucket: stored.bucket, key: stored.key })
+          .catch(() => undefined);
+      }
+      await prisma.case.delete({ where: { id: collectionCase.id } }).catch(() => undefined);
+      throw error;
+    }
 
     try {
       const parsed = await this.deps.ai.extractInvoice({
@@ -224,6 +265,12 @@ export class InvoiceIntakeService {
     email: InboundEmail,
     skippedAttachments: EmailIntakeResult["skippedAttachments"]
   ): Promise<IntakeCaseResult> {
+    const idempotencyKey = `inbound-invoice:${email.provider}:${email.providerId}:manual-review`;
+    const existing = await findExistingInboundCase(idempotencyKey);
+    if (existing) {
+      return existing;
+    }
+
     const collectionCase = await prisma.case.create({
       data: {
         organizationId,
@@ -239,7 +286,24 @@ export class InvoiceIntakeService {
         }
       }
     });
-    await createInboundCommunication(collectionCase.id, email, { skippedAttachments });
+    try {
+      await createInboundCommunication(
+        collectionCase.id,
+        email,
+        { skippedAttachments },
+        idempotencyKey
+      );
+    } catch (error) {
+      if (!isUniqueConstraintViolation(error)) {
+        throw error;
+      }
+      await prisma.case.delete({ where: { id: collectionCase.id } });
+      const raced = await findExistingInboundCase(idempotencyKey);
+      if (raced) {
+        return raced;
+      }
+      throw error;
+    }
 
     return {
       caseId: collectionCase.id,
@@ -268,7 +332,12 @@ export function assertInvoiceFile(file: InvoiceFilePayload): void {
   }
 }
 
-async function createInboundCommunication(caseId: string, email: InboundEmail, extraPayload?: Record<string, unknown>) {
+async function createInboundCommunication(
+  caseId: string,
+  email: InboundEmail,
+  extraPayload?: Record<string, unknown>,
+  idempotencyKey?: string
+) {
   const rawPayload = {
     ...safeEmailRaw(email),
     ...toJsonObject(extraPayload)
@@ -280,8 +349,12 @@ async function createInboundCommunication(caseId: string, email: InboundEmail, e
       direction: "INBOUND",
       channel: "EMAIL",
       status: "RECEIVED",
+      idempotencyKey,
       provider: email.provider,
       providerId: email.providerId,
+      messageId: normalizeMessageId(email.messageId),
+      inReplyTo: normalizeMessageId(email.inReplyTo),
+      references: email.references.map(normalizeMessageId).filter((value): value is string => Boolean(value)),
       fromAddress: email.from,
       toAddress: email.to.join(", "),
       subject: email.subject,
@@ -298,6 +371,9 @@ function safeEmailRaw(email: InboundEmail): Prisma.InputJsonObject {
   const payload = {
     provider: email.provider,
     providerId: email.providerId,
+    messageId: email.messageId,
+    inReplyTo: email.inReplyTo,
+    references: email.references,
     from: email.from,
     to: email.to,
     cc: email.cc,
@@ -306,6 +382,42 @@ function safeEmailRaw(email: InboundEmail): Prisma.InputJsonObject {
   } satisfies Prisma.InputJsonObject;
 
   return raw === undefined ? payload : ({ ...payload, raw } satisfies Prisma.InputJsonObject);
+}
+
+async function findExistingInboundCase(
+  idempotencyKey: string
+): Promise<IntakeCaseResult | null> {
+  const communication = await prisma.communication.findUnique({
+    where: { idempotencyKey },
+    include: { case: true }
+  });
+  if (!communication) {
+    return null;
+  }
+  return {
+    caseId: communication.caseId,
+    status: communication.case.status,
+    parseError:
+      communication.case.status === "MANUAL_REVIEW_REQUIRED"
+        ? "Previously received email requires manual review."
+        : null
+  };
+}
+
+function inboundInvoiceIdempotencyKey(
+  email: InboundEmail,
+  attachment: InboundEmailAttachment
+): string {
+  return `inbound-invoice:${email.provider}:${email.providerId}:${hashBytes(attachment.bytes)}`;
+}
+
+function normalizeMessageId(value: string | null | undefined): string | null {
+  const normalized = value?.trim().replace(/^<|>$/g, "").toLowerCase();
+  return normalized || null;
+}
+
+function isUniqueConstraintViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
 function hashBytes(bytes: Uint8Array): string {

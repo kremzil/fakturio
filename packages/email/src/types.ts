@@ -1,6 +1,7 @@
 export type SendEmailInput = {
   from: string;
   to: string[];
+  replyTo?: string[];
   cc?: string[];
   bcc?: string[];
   subject: string;
@@ -23,6 +24,9 @@ export type InboundEmailAttachment = {
 export type InboundEmail = {
   provider: string;
   providerId: string;
+  messageId: string | null;
+  inReplyTo: string | null;
+  references: string[];
   from: string;
   to: string[];
   cc: string[];

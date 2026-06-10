@@ -1,15 +1,16 @@
-import { Client, Connection } from "@temporalio/client";
+import {
+  WorkflowIdConflictPolicy,
+  WorkflowIdReusePolicy,
+  type Client
+} from "@temporalio/client";
 import { prisma } from "@fakturio/db";
 import { CASE_EVENT_TYPES } from "@fakturio/shared";
 import { CASE_TASK_QUEUE } from "@fakturio/workflows";
 
 export async function startPendingCaseWorkflows(input: {
-  temporalAddress: string;
-  namespace: string;
+  client: Client;
   taskQueue: string;
 }): Promise<void> {
-  const connection = await Connection.connect({ address: input.temporalAddress });
-  const client = new Client({ connection, namespace: input.namespace });
   const cases = await prisma.case.findMany({
     where: {
       status: "WAITING_FOR_DUE_DATE",
@@ -27,10 +28,12 @@ export async function startPendingCaseWorkflows(input: {
   for (const collectionCase of cases) {
     const workflowId = `case-${collectionCase.id}`;
     try {
-      await client.workflow.start("caseWorkflow", {
+      await input.client.workflow.start("caseWorkflow", {
         taskQueue: input.taskQueue || CASE_TASK_QUEUE,
         workflowId,
-        args: [{ caseId: collectionCase.id, organizationId: collectionCase.organizationId }]
+        args: [{ caseId: collectionCase.id, organizationId: collectionCase.organizationId }],
+        workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
+        workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING
       });
       await prisma.case.update({
         where: { id: collectionCase.id },

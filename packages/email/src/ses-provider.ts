@@ -1,5 +1,6 @@
 import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
 import { EmailProvider, InboundEmail, SendEmailInput, SentEmailResult } from "./types";
+import { extractRawMimeInput, parseMimeEmail } from "./mime";
 
 export type SesEmailProviderOptions = {
   region: string;
@@ -17,6 +18,7 @@ export class SesEmailProvider implements EmailProvider {
     const result = await this.client.send(
       new SendEmailCommand({
         FromEmailAddress: input.from,
+        ReplyToAddresses: input.replyTo,
         Destination: {
           ToAddresses: input.to,
           CcAddresses: input.cc,
@@ -42,17 +44,7 @@ export class SesEmailProvider implements EmailProvider {
   }
 
   async parseInbound(input: unknown): Promise<InboundEmail> {
-    return {
-      provider: "ses",
-      providerId: "ses-inbound-unparsed",
-      from: "",
-      to: [],
-      cc: [],
-      subject: null,
-      textBody: null,
-      htmlBody: null,
-      attachments: [],
-      raw: input
-    };
+    const { raw, providerId } = extractRawMimeInput(input);
+    return parseMimeEmail(raw, "ses", providerId);
   }
 }

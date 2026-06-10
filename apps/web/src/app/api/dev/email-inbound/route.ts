@@ -2,13 +2,20 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { ensureLocalBootstrap } from "@fakturio/db";
 import { FixtureEmailProvider } from "@fakturio/email";
-import { InvoiceIntakeService, resolveOrganizationForInboundEmail } from "@fakturio/intake";
+import {
+  DebtorReplyService,
+  InvoiceIntakeService,
+  resolveOrganizationForInboundEmail
+} from "@fakturio/intake";
 import { getDashboardCaseById } from "@/lib/case-data";
 
 export const runtime = "nodejs";
 
 const inboundEmailFixtureSchema = z.object({
   providerId: z.string().optional(),
+  messageId: z.string().nullable().default(null),
+  inReplyTo: z.string().nullable().default(null),
+  references: z.array(z.string()).default([]),
   from: z.string().email().default("sender@example.com"),
   to: z.array(z.string()).default(["invoices@fakturio.local"]),
   cc: z.array(z.string()).default([]),
@@ -42,6 +49,15 @@ export async function POST(request: Request) {
     }))
   });
 
+  const reply = await new DebtorReplyService().process(email);
+  if (reply) {
+    const collectionCase = await getDashboardCaseById(
+      reply.caseId,
+      reply.organizationId
+    );
+    return NextResponse.json({ kind: "DEBTOR_REPLY", reply, case: collectionCase });
+  }
+
   const { organization } = await ensureLocalBootstrap();
   const route = await resolveOrganizationForInboundEmail(email);
   const organizationId = route?.organizationId ?? organization.id;
@@ -52,6 +68,7 @@ export async function POST(request: Request) {
   const cases = await Promise.all(result.cases.map((item) => getDashboardCaseById(item.caseId, organizationId)));
 
   return NextResponse.json({
+    kind: "INVOICE_INTAKE",
     cases: cases.filter(Boolean),
     route,
     skippedAttachments: result.skippedAttachments

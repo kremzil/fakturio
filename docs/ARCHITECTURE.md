@@ -66,6 +66,8 @@ All customer-facing case reads and mutations must include `organizationId`. Web 
 
 The database is the source of truth. Temporal owns durable waiting and scheduled workflow execution. AI never owns state transitions; it returns structured data used by backend validation and workflow rules.
 
+Case state changes that must wake a workflow are written to `WorkflowCommand` in the same database transaction as the state transition. The worker claims commands with a lease and delivers them with Temporal `signalWithStart`. Signals are wake-up notifications only; the workflow reloads the organization-scoped case snapshot from PostgreSQL before deciding what to do.
+
 Temporal uses separate local databases (`temporal`, `temporal_visibility`) from the application database (`fakturio`) so Prisma migrations only manage application tables.
 
 ## Payment Check Workflow
@@ -91,3 +93,17 @@ Payment-check delivery uses `Communication` as a durable outbox:
 - Retry reclaim refreshes the stored recipient, body and action tokens before sending.
 - Marking the communication `SENT` and recording the audit `CaseEvent` happen in one transaction.
 - Activity timeout and lease TTL are shared workflow constants; the lease includes a grace interval beyond the Temporal timeout.
+
+## Inbound Email And Reply Classification
+
+`packages/email` parses raw RFC 822/MIME messages and preserves `Message-ID`, `In-Reply-To`, `References`, body and attachments. Production SES ingress uses a trusted receipt/Lambda/S3 adapter that posts raw MIME to `/api/email/inbound/ses`.
+
+Inbound processing order:
+
+1. Match a signed case-specific reply address when the sending adapter has assigned one.
+2. Match `In-Reply-To` or `References` to a stored outbound `Communication`.
+3. Otherwise resolve an active organization `EmailIntakeAddress` and process the message as invoice intake.
+
+Replies are idempotent by provider message id, stored as `Communication(INBOUND)`, classified through `AiProvider`, and added to the case timeline. Classification never changes the debt amount or closes the case automatically. Replayed invoice messages are deduplicated per provider message and attachment hash.
+
+The signed address codec and correlation path are implemented. Wiring that address into `Reply-To` belongs to the next outbound debtor-reminder step; current payment-check messages are sent to the customer account user and use signed HTTP actions.

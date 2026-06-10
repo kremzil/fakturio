@@ -38,7 +38,9 @@ Next.js runs at `http://localhost:3000`. Temporal UI runs at `http://localhost:8
 - Match counterparties within an `Organization` before creating new `Debtor`/`Customer` records.
 - Use provider interfaces for OpenAI, S3, SES, and Temporal activities.
 - Keep Temporal workflow code deterministic; perform side effects only in activities.
+- Persist case-state notifications in `WorkflowCommand`; deliver them through the worker with `signalWithStart` rather than coupling HTTP requests to Temporal availability.
 - Treat email activities as retryable side effects: use durable idempotency keys and an atomic send lease before calling a provider.
+- Correlate inbound replies only through signed case reply addresses or stored email thread headers. AI classification must not directly close a case or change debt amounts.
 - Public email action links must be signed, time-limited, read-only on GET, and mutate only after an explicit POST.
 - Before using Next.js APIs, consult the official Next.js docs/MCP for the current version.
 

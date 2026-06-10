@@ -18,6 +18,9 @@ export class FixtureEmailProvider implements EmailProvider {
     return {
       provider: "fixture",
       providerId: candidate.providerId ?? "fixture-inbound",
+      messageId: candidate.messageId ?? null,
+      inReplyTo: candidate.inReplyTo ?? null,
+      references: candidate.references ?? [],
       from: candidate.from ?? "debtor@example.com",
       to: candidate.to ?? ["system@example.com"],
       cc: candidate.cc ?? [],
