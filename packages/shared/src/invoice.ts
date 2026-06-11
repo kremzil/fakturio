@@ -78,9 +78,21 @@ export function emptyInvoiceExtractionResult(): InvoiceExtractionResult {
 }
 
 export const debtorReplyClassificationSchema = z.object({
-  intent: z.enum(["PAID", "PROMISED_TO_PAY", "DISPUTE", "INSTALLMENT_REQUEST", "NEEDS_HUMAN", "IGNORE_OR_OTHER"]),
+  intent: z.enum([
+    "PAID",
+    "PROMISED_TO_PAY",
+    "DISPUTE",
+    "INSTALLMENT_REQUEST",
+    "INSTALLMENT_ACCEPTED",
+    "INSTALLMENT_REJECTED",
+    "AUTOMATED_REPLY",
+    "NEEDS_HUMAN",
+    "IGNORE_OR_OTHER"
+  ]),
   promisedPaymentDate: nullableText,
   installmentRequested: z.boolean(),
+  explicitInstallmentAcceptance: z.boolean().default(false),
+  mentionedPaymentAmount: z.number().positive().nullable().default(null),
   summary: z.string(),
   confidence: z.number().min(0).max(1),
   warnings: z.array(z.string())

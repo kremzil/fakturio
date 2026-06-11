@@ -6,6 +6,7 @@ const workflowCommandUpdateMany = vi.fn();
 const caseUpdateMany = vi.fn();
 const transaction = vi.fn();
 const signalWithStart = vi.fn();
+const signal = vi.fn();
 
 vi.mock("@fakturio/db", () => ({
   prisma: {
@@ -36,6 +37,7 @@ beforeEach(() => {
   caseUpdateMany.mockReset();
   transaction.mockReset();
   signalWithStart.mockReset();
+  signal.mockReset();
 
   findMany.mockResolvedValue([]);
   workflowCommandUpdateMany.mockResolvedValue({ count: 1 });
@@ -55,7 +57,10 @@ describe("workflow command dispatcher", () => {
     };
     findMany.mockResolvedValue([command]);
     updateManyAndReturn.mockResolvedValue([{ ...command, leaseId: "lease" }]);
-    signalWithStart.mockResolvedValue({ workflowId: "case-case-1" });
+    signalWithStart.mockResolvedValue({
+      workflowId: "case-case-1",
+      signal
+    });
 
     await dispatchPendingWorkflowCommands(client as never, "test-queue");
 
@@ -64,8 +69,18 @@ describe("workflow command dispatcher", () => {
       expect.objectContaining({
         workflowId: "case-case-1",
         taskQueue: "test-queue",
-        signalArgs: [{ commandId: "cmd-1", status: "CLOSED_PAID" }]
+        signalArgs: [
+          {
+            commandId: "cmd-1",
+            type: "CASE_STATE_CHANGED",
+            payload: { status: "CLOSED_PAID" }
+          }
+        ]
       })
+    );
+    expect(signal).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "caseStateChanged" }),
+      { commandId: "cmd-1", status: "CLOSED_PAID" }
     );
     expect(transaction).toHaveBeenCalledTimes(1);
     expect(workflowCommandUpdateMany).toHaveBeenCalledWith(
@@ -93,6 +108,28 @@ describe("workflow command dispatcher", () => {
 
     expect(signalWithStart).not.toHaveBeenCalled();
     expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it("does not send a legacy signal for new command types", async () => {
+    const command = {
+      id: "cmd-reply",
+      caseId: "case-1",
+      organizationId: "org-1",
+      type: "DEBTOR_REPLY_RECEIVED",
+      payload: { communicationId: "comm-1" },
+      attempts: 0
+    };
+    findMany.mockResolvedValue([command]);
+    updateManyAndReturn.mockResolvedValue([{ ...command, leaseId: "lease" }]);
+    signalWithStart.mockResolvedValue({
+      workflowId: "case-case-1",
+      signal
+    });
+
+    await dispatchPendingWorkflowCommands(client as never, "test-queue");
+
+    expect(signalWithStart).toHaveBeenCalledTimes(1);
+    expect(signal).not.toHaveBeenCalled();
   });
 
   it("releases the lease with backoff when Temporal delivery fails", async () => {

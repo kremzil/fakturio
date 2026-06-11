@@ -4,12 +4,16 @@ import {
   WorkflowIdReusePolicy,
   type Client
 } from "@temporalio/client";
-import { CASE_STATUSES, type CaseStatus } from "@fakturio/shared";
+import {
+  CASE_STATUSES,
+  WORKFLOW_COMMAND_TYPES,
+  type CaseStatus,
+  type CaseWorkflowCommand
+} from "@fakturio/shared";
 import { prisma } from "@fakturio/db";
 import {
-  CASE_STATE_CHANGED_COMMAND,
-  caseStateChangedSignal,
-  type CaseStateChangedSignalPayload,
+  caseCommandSignal,
+  legacyCaseStateChangedSignal,
   type CaseWorkflowInput
 } from "@fakturio/workflows";
 
@@ -54,22 +58,32 @@ export async function dispatchPendingWorkflowCommands(
     }
 
     try {
-      const payload = parseCaseStateChangedCommand(candidate.type, candidate.payload);
+      const command = parseWorkflowCommand(
+        candidate.id,
+        candidate.type,
+        candidate.payload
+      );
       const workflowId = `case-${candidate.caseId}`;
       const workflowInput: CaseWorkflowInput = {
         caseId: candidate.caseId,
         organizationId: candidate.organizationId
       };
 
-      await client.workflow.signalWithStart("caseWorkflow", {
+      const handle = await client.workflow.signalWithStart("caseWorkflow", {
         workflowId,
         taskQueue,
         args: [workflowInput],
-        signal: caseStateChangedSignal,
-        signalArgs: [{ commandId: candidate.id, status: payload.status }],
+        signal: caseCommandSignal,
+        signalArgs: [command],
         workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
         workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING
       });
+      if (command.type === WORKFLOW_COMMAND_TYPES.caseStateChanged) {
+        await handle.signal(legacyCaseStateChangedSignal, {
+          commandId: command.commandId,
+          status: command.payload.status
+        });
+      }
 
       await prisma.$transaction([
         prisma.workflowCommand.updateMany({
@@ -103,24 +117,54 @@ export async function dispatchPendingWorkflowCommands(
   }
 }
 
-function parseCaseStateChangedCommand(
+function parseWorkflowCommand(
+  commandId: string,
   type: string,
   payload: unknown
-): Omit<CaseStateChangedSignalPayload, "commandId"> {
-  if (type !== CASE_STATE_CHANGED_COMMAND) {
-    throw new Error(`Unsupported workflow command type ${type}.`);
+): CaseWorkflowCommand {
+  const record =
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>)
+      : {};
+
+  if (type === WORKFLOW_COMMAND_TYPES.caseStateChanged) {
+    const status = record.status;
+    if (
+      typeof status !== "string" ||
+      !CASE_STATUSES.includes(status as CaseStatus)
+    ) {
+      throw new Error("Workflow command payload contains an invalid case status.");
+    }
+    return {
+      commandId,
+      type,
+      payload: { status: status as CaseStatus }
+    };
   }
 
-  const status =
-    payload && typeof payload === "object" && "status" in payload
-      ? (payload as { status?: unknown }).status
-      : undefined;
-
-  if (typeof status !== "string" || !CASE_STATUSES.includes(status as CaseStatus)) {
-    throw new Error("Workflow command payload contains an invalid case status.");
+  if (
+    type === WORKFLOW_COMMAND_TYPES.debtorReplyReceived &&
+    typeof record.communicationId === "string"
+  ) {
+    return {
+      commandId,
+      type,
+      payload: { communicationId: record.communicationId }
+    };
   }
 
-  return { status: status as CaseStatus };
+  if (
+    type === WORKFLOW_COMMAND_TYPES.paymentCheckResolved &&
+    typeof record.paymentCheckId === "string"
+  ) {
+    return {
+      commandId,
+      type,
+      payload: { paymentCheckId: record.paymentCheckId }
+    };
+  }
+
+  throw new Error(`Unsupported or invalid workflow command ${type}.`);
 }
 
 function retryDelayMs(attempt: number): number {

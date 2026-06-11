@@ -69,6 +69,36 @@ enum IntakeSource {
   EMAIL
 }
 
+enum PaymentCheckReason {
+  DUE_DATE
+  FOLLOW_UP
+  DEBTOR_CLAIMED_PAID
+  PROMISE_DUE
+  INSTALLMENT_PAYMENT
+}
+
+enum PaymentCheckStatus {
+  PENDING
+  SENT
+  RESOLVED_PAID
+  RESOLVED_NOT_PAID
+}
+
+enum InstallmentPlanStatus {
+  PROPOSED
+  ACTIVE
+  COMPLETED
+  BROKEN
+  REJECTED
+}
+
+enum InstallmentPaymentStatus {
+  PENDING
+  PAID
+  MISSED
+  MANUAL_REVIEW_REQUIRED
+}
+
 model User {
   id            String    @id @default(cuid())
   name          String?
@@ -236,6 +266,11 @@ model Case {
   confirmedByUserId String?
   confirmedAt       DateTime?
   closedAt          DateTime?
+  nextActionAt      DateTime?
+  automationPausedAt DateTime?
+  automationPauseReason String?
+  clarificationCount Int @default(0)
+  promiseExtensionUsed Boolean @default(false)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
@@ -246,6 +281,8 @@ model Case {
   events           CaseEvent[]
   communications   Communication[]
   paymentPromises  PaymentPromise[]
+  paymentChecks    PaymentCheck[]
+  installmentPlans InstallmentPlan[]
   workflowCommands WorkflowCommand[]
 
   @@index([organizationId])
@@ -253,6 +290,8 @@ model Case {
   @@index([status])
   @@index([invoiceNumber])
   @@index([dueDate])
+  @@index([nextActionAt])
+  @@index([automationPausedAt])
   @@index([createdAt])
 }
 
@@ -350,6 +389,10 @@ model Communication {
 
   case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
   invoiceDocuments InvoiceDocument[]
+  attachments CommunicationAttachment[]
+  paymentPromises PaymentPromise[]
+  installmentPlans InstallmentPlan[]
+  paymentChecks PaymentCheck[]
 
   @@index([caseId])
   @@index([direction])
@@ -360,9 +403,28 @@ model Communication {
   @@index([createdAt])
 }
 
+model CommunicationAttachment {
+  id              String   @id @default(cuid())
+  communicationId String
+  storageBucket   String
+  storageKey      String
+  originalName    String
+  mimeType        String
+  sizeBytes       Int
+  sha256          String
+  createdAt       DateTime @default(now())
+
+  communication Communication @relation(fields: [communicationId], references: [id], onDelete: Cascade)
+
+  @@index([communicationId])
+  @@unique([storageBucket, storageKey])
+  @@unique([communicationId, sha256, originalName])
+}
+
 model PaymentPromise {
   id           String   @id @default(cuid())
   caseId       String
+  communicationId String?
   promisedDate DateTime
   amount       Decimal? @db.Decimal(12, 2)
   currency     String?
@@ -373,7 +435,76 @@ model PaymentPromise {
   updatedAt    DateTime @updatedAt
 
   case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  communication Communication? @relation(fields: [communicationId], references: [id], onDelete: SetNull)
 
   @@index([caseId])
+  @@index([communicationId])
   @@index([promisedDate])
+}
+
+model PaymentCheck {
+  id                   String             @id @default(cuid())
+  caseId               String
+  communicationId      String?
+  installmentPaymentId String?            @unique
+  sourceKey            String             @unique
+  reason               PaymentCheckReason
+  sequence             Int
+  status               PaymentCheckStatus @default(PENDING)
+  expectedAmount       Decimal?           @db.Decimal(12, 2)
+  currency             String?
+  expiresAt            DateTime
+  resolvedAt           DateTime?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  communication Communication? @relation(fields: [communicationId], references: [id], onDelete: SetNull)
+  installmentPayment InstallmentPayment? @relation(fields: [installmentPaymentId], references: [id], onDelete: SetNull)
+
+  @@index([caseId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model InstallmentPlan {
+  id                    String                @id @default(cuid())
+  caseId                String
+  sourceCommunicationId String?
+  status                InstallmentPlanStatus @default(PROPOSED)
+  totalAmount           Decimal               @db.Decimal(12, 2)
+  currency              String
+  proposedAt            DateTime              @default(now())
+  acceptedAt            DateTime?
+  completedAt           DateTime?
+  brokenAt              DateTime?
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  sourceCommunication Communication? @relation(fields: [sourceCommunicationId], references: [id], onDelete: SetNull)
+  payments InstallmentPayment[]
+
+  @@index([caseId])
+  @@index([status])
+}
+
+model InstallmentPayment {
+  id             String                   @id @default(cuid())
+  planId         String
+  sequence       Int
+  amount         Decimal                  @db.Decimal(12, 2)
+  dueDate        DateTime
+  status         InstallmentPaymentStatus @default(PENDING)
+  paidAt         DateTime?
+  missedAt       DateTime?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+
+  plan InstallmentPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  paymentCheck PaymentCheck?
+
+  @@unique([planId, sequence])
+  @@index([dueDate])
+  @@index([status])
 }

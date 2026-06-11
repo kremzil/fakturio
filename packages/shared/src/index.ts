@@ -4,4 +4,6 @@ export * from "./case-status";
 export * from "./validation";
 export * from "./payment-check-token";
 export * from "./case-reply-token";
+export * from "./reply-policy";
+export * from "./workflow-command";
 export * from "./types";

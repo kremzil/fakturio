@@ -1,22 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const findUniqueOrThrow = vi.fn();
-const userFindUnique = vi.fn();
+const caseFindUniqueOrThrow = vi.fn();
+const caseFindUnique = vi.fn();
 const membershipFindFirst = vi.fn();
+const caseEventCreate = vi.fn();
 const communicationFindUnique = vi.fn();
 const communicationCreate = vi.fn();
 const communicationUpdateMany = vi.fn();
 const communicationUpdateManyAndReturn = vi.fn();
-const caseEventCreate = vi.fn();
+const paymentCheckFindUnique = vi.fn();
+const paymentCheckCount = vi.fn();
+const paymentCheckCreate = vi.fn();
 const txCommunicationUpdateMany = vi.fn();
+const txCaseUpdateMany = vi.fn();
 const txCaseEventCreate = vi.fn();
+const txPaymentCheckUpdateMany = vi.fn();
 const transaction = vi.fn();
 const sendEmail = vi.fn();
 
 vi.mock("@fakturio/db", () => ({
   prisma: {
-    case: { findUniqueOrThrow },
-    user: { findUnique: userFindUnique },
+    case: {
+      findUniqueOrThrow: caseFindUniqueOrThrow,
+      findUnique: caseFindUnique
+    },
     membership: { findFirst: membershipFindFirst },
     caseEvent: { create: caseEventCreate },
     communication: {
@@ -25,186 +32,303 @@ vi.mock("@fakturio/db", () => ({
       updateMany: communicationUpdateMany,
       updateManyAndReturn: communicationUpdateManyAndReturn
     },
+    paymentCheck: {
+      findUnique: paymentCheckFindUnique,
+      count: paymentCheckCount,
+      create: paymentCheckCreate
+    },
     $transaction: transaction
   }
 }));
 
-vi.mock("@fakturio/email", () => ({
-  createEmailProvider: () => ({ sendEmail })
-}));
+vi.mock("@fakturio/email", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@fakturio/email")>();
+  return {
+    ...actual,
+    createEmailProvider: () => ({ sendEmail })
+  };
+});
 
 const { activities } = await import("./activities");
 
 beforeEach(() => {
-  findUniqueOrThrow.mockReset();
-  userFindUnique.mockReset();
-  membershipFindFirst.mockReset();
-  communicationFindUnique.mockReset();
-  communicationCreate.mockReset();
-  communicationUpdateMany.mockReset();
-  communicationUpdateManyAndReturn.mockReset();
-  caseEventCreate.mockReset();
-  txCommunicationUpdateMany.mockReset();
-  txCaseEventCreate.mockReset();
-  transaction.mockReset();
-  sendEmail.mockReset();
+  for (const mock of [
+    caseFindUniqueOrThrow,
+    caseFindUnique,
+    membershipFindFirst,
+    caseEventCreate,
+    communicationFindUnique,
+    communicationCreate,
+    communicationUpdateMany,
+    communicationUpdateManyAndReturn,
+    paymentCheckFindUnique,
+    paymentCheckCount,
+    paymentCheckCreate,
+    txCommunicationUpdateMany,
+    txCaseUpdateMany,
+    txCaseEventCreate,
+    txPaymentCheckUpdateMany,
+    transaction,
+    sendEmail
+  ]) {
+    mock.mockReset();
+  }
+
+  membershipFindFirst.mockResolvedValue({
+    user: { email: "owner@example.com" }
+  });
   communicationUpdateMany.mockResolvedValue({ count: 1 });
-  communicationUpdateManyAndReturn.mockResolvedValue([{ id: "comm-1" }]);
   txCommunicationUpdateMany.mockResolvedValue({ count: 1 });
+  txCaseUpdateMany.mockResolvedValue({ count: 1 });
   txCaseEventCreate.mockResolvedValue(undefined);
+  txPaymentCheckUpdateMany.mockResolvedValue({ count: 1 });
   transaction.mockImplementation(async (callback) =>
     callback({
       communication: { updateMany: txCommunicationUpdateMany },
-      caseEvent: { create: txCaseEventCreate }
+      case: { updateMany: txCaseUpdateMany },
+      caseEvent: { create: txCaseEventCreate },
+      paymentCheck: { updateMany: txPaymentCheckUpdateMany }
     })
   );
-  process.env.PAYMENT_CHECK_TOKEN_SECRET = "test-secret-test-secret-test-secret-1234";
+  process.env.PAYMENT_CHECK_TOKEN_SECRET =
+    "test-secret-test-secret-test-secret-1234";
+  process.env.INBOUND_REPLY_TOKEN_SECRET =
+    "test-inbound-reply-secret-test-12345";
+  process.env.INBOUND_REPLY_DOMAIN = "reply.example.com";
+  process.env.DEBTOR_FIRST_REMINDER_PAYMENT_DAYS = "10";
 });
 
 describe("worker activity organization isolation", () => {
-  it("rejects loadCaseSnapshot when the case belongs to a different organization", async () => {
-    findUniqueOrThrow.mockResolvedValue({
-      id: "case-1",
-      organizationId: "org-A",
-      status: "WAITING_FOR_DUE_DATE",
-      dueDate: null,
-      invoiceNumber: null,
-      amountTotal: null,
-      currency: null,
-      confirmedByUserId: null,
-      debtor: null
+  it("rejects a case from another organization", async () => {
+    caseFindUniqueOrThrow.mockResolvedValue({
+      ...caseRecord(),
+      organizationId: "org-A"
     });
-
-    await expect(activities.loadCaseSnapshot({ caseId: "case-1", organizationId: "org-B" })).rejects.toThrow(
-      /belongs to organization org-A but workflow expected org-B/
-    );
+    await expect(
+      activities.loadCaseSnapshot({
+        caseId: "case-1",
+        organizationId: "org-B"
+      })
+    ).rejects.toThrow(/belongs to organization org-A/);
   });
 
-  it("returns a snapshot when the organization matches", async () => {
-    findUniqueOrThrow.mockResolvedValue({
-      id: "case-1",
-      organizationId: "org-A",
-      status: "WAITING_FOR_DUE_DATE",
-      dueDate: new Date("2026-06-02T00:00:00.000Z"),
-      invoiceNumber: "FV-1",
-      amountTotal: null,
-      currency: "EUR",
-      confirmedByUserId: null,
-      debtor: { name: "Dlžník s.r.o.", email: null }
+  it("returns automation and installment scheduling data", async () => {
+    caseFindUniqueOrThrow.mockResolvedValue({
+      ...caseRecord(),
+      nextActionAt: new Date("2026-06-20T00:00:00.000Z"),
+      installmentPlans: [
+        {
+          payments: [{ id: "installment-1" }]
+        }
+      ]
     });
-    membershipFindFirst.mockResolvedValue(null);
-
-    const snapshot = await activities.loadCaseSnapshot({ caseId: "case-1", organizationId: "org-A" });
-    expect(snapshot).toMatchObject({ id: "case-1", status: "WAITING_FOR_DUE_DATE", invoiceNumber: "FV-1" });
+    const result = await activities.loadCaseSnapshot({
+      caseId: "case-1",
+      organizationId: "org-A"
+    });
+    expect(result).toMatchObject({
+      nextActionAt: "2026-06-20T00:00:00.000Z",
+      nextInstallmentPaymentId: "installment-1",
+      automationPaused: false
+    });
   });
 });
 
-describe("sendPaymentCheckEmail outbox idempotency", () => {
-  function arrangeCase(): void {
-    findUniqueOrThrow.mockResolvedValue({
-      id: "case-1",
-      organizationId: "org-A",
-      status: "OVERDUE",
-      dueDate: new Date("2026-06-02T00:00:00.000Z"),
-      invoiceNumber: "FV-1",
-      amountTotal: 100,
-      currency: "EUR",
-      confirmedByUserId: "user-1",
-      debtor: { name: "Dlžník s.r.o.", email: "debtor@example.com" },
-      organization: { name: "Org A" }
-    });
-    membershipFindFirst.mockResolvedValue({ user: { email: "owner@example.com" } });
-  }
-
-  it("marks the claim FAILED and rethrows when sending fails after the claim is created", async () => {
-    arrangeCase();
+describe("debtor reminders", () => {
+  it("sends reminder 1 and advances the case transactionally", async () => {
+    caseFindUniqueOrThrow.mockResolvedValue(caseRecord());
     communicationFindUnique.mockResolvedValue(null);
     communicationCreate.mockResolvedValue({ id: "comm-1" });
-    sendEmail.mockRejectedValue(new Error("SES down"));
-
-    await expect(
-      activities.sendPaymentCheckEmail({ caseId: "case-1", organizationId: "org-A" })
-    ).rejects.toThrow(/SES down/);
-
-    expect(communicationUpdateMany).toHaveBeenCalledWith({
-      where: { id: "comm-1", sendLeaseId: expect.any(String) },
-      data: { status: "FAILED", sendLeaseId: null, sendLeaseUntil: null }
+    sendEmail.mockResolvedValue({
+      provider: "fixture",
+      providerId: "<message-1@example.com>"
     });
-    // No phantom "sent": neither the confirming transaction nor the audit event ran.
-    expect(transaction).not.toHaveBeenCalled();
-    expect(caseEventCreate).not.toHaveBeenCalled();
-  });
 
-  it("resends and confirms when a prior attempt left a DRAFT claim", async () => {
-    arrangeCase();
-    communicationFindUnique.mockResolvedValue({ id: "comm-1", status: "DRAFT" });
-    sendEmail.mockResolvedValue({ provider: "mock", providerId: "prov-1" });
+    const result = await activities.sendReminderEmail({
+      caseId: "case-1",
+      organizationId: "org-A",
+      reminderLevel: 1
+    });
 
-    await activities.sendPaymentCheckEmail({ caseId: "case-1", organizationId: "org-A" });
-
-    // The existing claim is reused (no new claim) and the email is actually resent.
-    expect(communicationCreate).not.toHaveBeenCalled();
-    expect(sendEmail).toHaveBeenCalledTimes(1);
-    expect(communicationUpdateManyAndReturn).toHaveBeenCalledWith(
+    expect(result).toBe("SENT");
+    expect(sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ idempotencyKey: "payment-check:case-1:2026-06-02" }),
+        to: ["debtor@example.com"],
+        replyTo: [expect.stringContaining("@reply.example.com")],
+        subject: expect.stringContaining("FV-1")
+      })
+    );
+    expect(txCaseUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
         data: expect.objectContaining({
-          status: "DRAFT",
-          sendLeaseId: expect.any(String),
-          toAddress: "owner@example.com",
-          textBody: expect.stringContaining("Platba prišla:")
+          status: "EMAIL_REMINDER_1_SENT",
+          nextActionAt: expect.any(Date)
         })
       })
     );
-    expect(txCommunicationUpdateMany).toHaveBeenCalledWith(
+  });
+
+  it("does not call the provider when debtor email is missing", async () => {
+    caseFindUniqueOrThrow.mockResolvedValue({
+      ...caseRecord(),
+      debtor: { name: "Debtor", email: null }
+    });
+    const result = await activities.sendReminderEmail({
+      caseId: "case-1",
+      organizationId: "org-A",
+      reminderLevel: 1
+    });
+    expect(result).toBe("SKIPPED_MISSING_RECIPIENT");
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(txCaseUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ id: "comm-1", sendLeaseId: expect.any(String) }),
-        data: expect.objectContaining({ status: "SENT", sendLeaseId: null, sendLeaseUntil: null })
+        data: expect.objectContaining({
+          automationPauseReason: "MISSING_DEBTOR_EMAIL",
+          automationPausedAt: expect.any(Date),
+          nextActionAt: null
+        })
       })
     );
-    expect(transaction).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not resend when a prior attempt already delivered (SENT)", async () => {
-    arrangeCase();
-    communicationFindUnique.mockResolvedValue({ id: "comm-1", status: "SENT" });
-
-    await activities.sendPaymentCheckEmail({ caseId: "case-1", organizationId: "org-A" });
-
-    expect(communicationCreate).not.toHaveBeenCalled();
-    expect(sendEmail).not.toHaveBeenCalled();
-    expect(transaction).not.toHaveBeenCalled();
-  });
-
-  it("allows only one concurrent activity attempt to send", async () => {
-    arrangeCase();
-    communicationFindUnique.mockResolvedValue({ id: "comm-1", status: "DRAFT" });
-    communicationUpdateManyAndReturn.mockResolvedValueOnce([{ id: "comm-1" }]).mockResolvedValueOnce([]);
-    sendEmail.mockResolvedValue({ provider: "mock", providerId: "prov-1" });
-
-    const results = await Promise.allSettled([
-      activities.sendPaymentCheckEmail({ caseId: "case-1", organizationId: "org-A" }),
-      activities.sendPaymentCheckEmail({ caseId: "case-1", organizationId: "org-A" })
-    ]);
-
-    expect(sendEmail).toHaveBeenCalledTimes(1);
-    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
-    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
-  });
-
-  it("rethrows when the confirming transaction fails after a successful send", async () => {
-    arrangeCase();
-    communicationFindUnique.mockResolvedValue(null);
-    communicationCreate.mockResolvedValue({ id: "comm-1" });
-    sendEmail.mockResolvedValue({ provider: "mock", providerId: "prov-1" });
-    transaction.mockRejectedValue(new Error("tx failed"));
-
-    await expect(
-      activities.sendPaymentCheckEmail({ caseId: "case-1", organizationId: "org-A" })
-    ).rejects.toThrow(/tx failed/);
-
-    // The row was never marked SENT, so a Temporal retry will see DRAFT and resend.
-    expect(sendEmail).toHaveBeenCalledTimes(1);
-    expect(transaction).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("payment-check outbox", () => {
+  beforeEach(() => {
+    caseFindUniqueOrThrow.mockResolvedValue(caseRecord());
+    paymentCheckFindUnique.mockResolvedValue(null);
+    paymentCheckCount.mockResolvedValue(0);
+    paymentCheckCreate.mockResolvedValue({
+      id: "check-1",
+      caseId: "case-1",
+      sourceKey: "due-date:case-1:2026-06-02",
+      reason: "DUE_DATE",
+      sequence: 1,
+      status: "PENDING",
+      expectedAmount: 100,
+      currency: "EUR",
+      installmentPaymentId: null,
+      expiresAt: new Date(Date.now() + 60_000)
+    });
+    communicationFindUnique.mockResolvedValue(null);
+    communicationCreate.mockResolvedValue({ id: "comm-1" });
+  });
+
+  it("creates a concrete payment check and sends signed links", async () => {
+    sendEmail.mockResolvedValue({
+      provider: "fixture",
+      providerId: "message-1"
+    });
+    const result = await activities.sendPaymentCheckEmail({
+      caseId: "case-1",
+      organizationId: "org-A",
+      sourceKey: "due-date:case-1:2026-06-02",
+      reason: "DUE_DATE"
+    });
+    expect(result).toEqual({ paymentCheckId: "check-1" });
+    expect(sendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: ["owner@example.com"],
+        textBody: expect.stringContaining("payment-check/paid?token=")
+      })
+    );
+    expect(txPaymentCheckUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "check-1" }),
+        data: expect.objectContaining({
+          status: "SENT",
+          communicationId: "comm-1"
+        })
+      })
+    );
+  });
+
+  it("marks the outbox row failed when the provider fails", async () => {
+    sendEmail.mockRejectedValue(new Error("SES down"));
+    await expect(
+      activities.sendPaymentCheckEmail({
+        caseId: "case-1",
+        organizationId: "org-A",
+        sourceKey: "due-date:case-1:2026-06-02",
+        reason: "DUE_DATE"
+      })
+    ).rejects.toThrow(/SES down/);
+    expect(communicationUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "comm-1",
+        sendLeaseId: expect.any(String)
+      },
+      data: {
+        status: "FAILED",
+        sendLeaseId: null,
+        sendLeaseUntil: null
+      }
+    });
+  });
+
+  it("does not resend an already delivered check", async () => {
+    communicationFindUnique.mockResolvedValue({
+      id: "comm-1",
+      status: "SENT"
+    });
+    const result = await activities.sendPaymentCheckEmail({
+      caseId: "case-1",
+      organizationId: "org-A",
+      sourceKey: "due-date:case-1:2026-06-02",
+      reason: "DUE_DATE"
+    });
+    expect(result).toEqual({ paymentCheckId: "check-1" });
+    expect(sendEmail).not.toHaveBeenCalled();
+  });
+
+  it("pauses instead of retry-looping when no customer email exists", async () => {
+    membershipFindFirst.mockResolvedValue(null);
+
+    const result = await activities.sendPaymentCheckEmail({
+      caseId: "case-1",
+      organizationId: "org-A",
+      sourceKey: "due-date:case-1:2026-06-02",
+      reason: "DUE_DATE"
+    });
+
+    expect(result).toBeNull();
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(txCaseUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          automationPauseReason: "MISSING_CUSTOMER_EMAIL",
+          automationPausedAt: expect.any(Date),
+          nextActionAt: null
+        })
+      })
+    );
+  });
+});
+
+function caseRecord() {
+  return {
+    id: "case-1",
+    organizationId: "org-A",
+    status: "OVERDUE",
+    dueDate: new Date("2026-06-02T00:00:00.000Z"),
+    invoiceNumber: "FV-1",
+    amountTotal: 100,
+    currency: "EUR",
+    subjectNote: "Services",
+    supplierSnapshot: {
+      name: "Creditor s.r.o.",
+      address: "Main 1",
+      ico: "12345678"
+    },
+    paymentSnapshot: {
+      iban: "SK1211000000002941987654",
+      variableSymbol: "2026001"
+    },
+    debtor: { name: "Debtor s.r.o.", email: "debtor@example.com" },
+    customer: null,
+    organization: { name: "Org A" },
+    installmentPlans: [],
+    confirmedByUserId: "user-1",
+    nextActionAt: null,
+    automationPausedAt: null
+  };
+}

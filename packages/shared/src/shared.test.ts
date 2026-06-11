@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canTransitionCase } from "./case-status";
+import { assertCaseTransition, canTransitionCase } from "./case-status";
 import { invoiceExtractionResultSchema } from "./invoice";
 import { validateInvoiceForWorkflow } from "./validation";
 
@@ -40,5 +40,9 @@ describe("shared domain", () => {
   it("blocks unsupported direct legal action transitions", () => {
     expect(canTransitionCase("OVERDUE", "READY_FOR_LEGAL_ACTION")).toBe(false);
     expect(canTransitionCase("FINAL_NOTICE_SENT", "READY_FOR_LEGAL_ACTION")).toBe(true);
+    expect(canTransitionCase("INSTALLMENT_PLAN_SENT", "EMAIL_REMINDER_1_SENT")).toBe(true);
+    expect(() =>
+      assertCaseTransition("OVERDUE", "READY_FOR_LEGAL_ACTION")
+    ).toThrow(/Unsupported case transition/);
   });
 });

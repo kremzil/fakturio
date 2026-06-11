@@ -1,15 +1,22 @@
+import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
-import { randomUUID } from "node:crypto";
-import { createAiProvider } from "@fakturio/ai";
 import { prisma } from "@fakturio/db";
-import type { InboundEmail } from "@fakturio/email";
+import type { InboundEmail, InboundEmailAttachment } from "@fakturio/email";
+import {
+  createStorageProvider,
+  type StorageProvider
+} from "@fakturio/storage";
 import {
   CASE_EVENT_TYPES,
   requireInboundReplyTokenSecret,
   verifyCaseReplyAddress,
-  type AiProvider,
+  WORKFLOW_COMMAND_TYPES,
   type DebtorReplyClassification
 } from "@fakturio/shared";
+import {
+  selectReplyAttachments,
+  type RejectedReplyAttachment
+} from "./reply-attachment-policy";
 
 export type DebtorReplyResult = {
   caseId: string;
@@ -21,7 +28,9 @@ export type DebtorReplyResult = {
 };
 
 export class DebtorReplyService {
-  constructor(private readonly ai: AiProvider = createAiProvider()) {}
+  constructor(
+    private readonly storage: StorageProvider = createStorageProvider()
+  ) {}
 
   async process(email: InboundEmail): Promise<DebtorReplyResult | null> {
     const matched = await resolveInboundReplyCase(email);
@@ -29,6 +38,7 @@ export class DebtorReplyService {
       return null;
     }
 
+    const attachmentSelection = selectReplyAttachments(email.attachments);
     const idempotencyKey = `inbound-reply:${email.provider}:${email.providerId}`;
     let communication = await prisma.communication.findUnique({
       where: { idempotencyKey }
@@ -49,18 +59,23 @@ export class DebtorReplyService {
               providerId: email.providerId,
               messageId: normalizeMessageId(email.messageId),
               inReplyTo: normalizeMessageId(email.inReplyTo),
-              references: email.references.map(normalizeMessageId).filter((value): value is string => Boolean(value)),
+              references: email.references
+                .map(normalizeMessageId)
+                .filter((value): value is string => Boolean(value)),
               fromAddress: email.from,
               toAddress: email.to.join(", "),
               subject: email.subject,
               textBody: email.textBody,
               htmlBody: email.htmlBody,
-              rawPayload: safeEmailRaw(email),
+              rawPayload: safeEmailRaw(email, attachmentSelection.rejected),
               receivedAt: new Date()
             }
           });
 
-          await tx.caseEvent.create({
+          const senderMatchesDebtor = matched.debtorEmail
+            ? matched.debtorEmail.toLowerCase() === email.from.toLowerCase()
+            : false;
+          const receivedEvent = await tx.caseEvent.create({
             data: {
               caseId: matched.caseId,
               actorType: "EMAIL_PROVIDER",
@@ -69,10 +84,19 @@ export class DebtorReplyService {
               payload: {
                 communicationId: created.id,
                 correlation: matched.correlation,
-                senderMatchesDebtor: matched.debtorEmail
-                  ? matched.debtorEmail.toLowerCase() === email.from.toLowerCase()
-                  : null
+                senderMatchesDebtor,
+                automated: isAutomatedEmail(email)
               }
+            }
+          });
+
+          await tx.workflowCommand.create({
+            data: {
+              caseId: matched.caseId,
+              organizationId: matched.organizationId,
+              type: WORKFLOW_COMMAND_TYPES.debtorReplyReceived,
+              idempotencyKey: `debtor-reply:${receivedEvent.id}`,
+              payload: { communicationId: created.id }
             }
           });
 
@@ -89,121 +113,79 @@ export class DebtorReplyService {
       }
     }
 
-    const existingClassification = parseStoredClassification(
+    await this.persistAttachments(
+      matched.organizationId,
+      matched.caseId,
+      communication.id,
+      attachmentSelection.accepted
+    );
+
+    const classification = parseStoredClassification(
       communication.aiClassification
     );
-    if (existingClassification) {
-      return {
-        caseId: matched.caseId,
-        organizationId: matched.organizationId,
-        communicationId: communication.id,
-        classification: existingClassification,
-        classificationPending: false,
-        duplicate: true
-      };
-    }
-
-    const classificationLeaseId = randomUUID();
-    const classificationLeaseUntil = new Date(Date.now() + 2 * 60_000);
-    const claimed = await prisma.communication.updateMany({
-      where: {
-        id: communication.id,
-        aiClassification: { equals: Prisma.DbNull },
-        OR: [
-          { classificationLeaseUntil: null },
-          { classificationLeaseUntil: { lt: new Date() } }
-        ]
-      },
-      data: {
-        classificationLeaseId,
-        classificationLeaseUntil
-      }
-    });
-
-    if (claimed.count !== 1) {
-      const current = await prisma.communication.findUniqueOrThrow({
-        where: { id: communication.id }
-      });
-      return {
-        caseId: matched.caseId,
-        organizationId: matched.organizationId,
-        communicationId: communication.id,
-        classification: parseStoredClassification(current.aiClassification),
-        classificationPending: true,
-        duplicate: true
-      };
-    }
-
-    const messageText = email.textBody?.trim() || stripHtml(email.htmlBody);
-    let classification: DebtorReplyClassification;
-    try {
-      classification = messageText
-        ? await this.ai.classifyDebtorReply({
-            caseId: matched.caseId,
-            messageText,
-            latestCaseSummary: matched.caseSummary
-          })
-        : {
-            intent: "NEEDS_HUMAN" as const,
-            promisedPaymentDate: null,
-            installmentRequested: false,
-            summary: "Inbound reply did not contain a readable text body.",
-            confidence: 1,
-            warnings: ["Message requires manual review because no readable body was found."]
-          };
-
-      await prisma.$transaction(async (tx) => {
-        const updated = await tx.communication.updateMany({
-          where: {
-            id: communication.id,
-            classificationLeaseId
-          },
-          data: {
-            aiClassification: classification as unknown as Prisma.InputJsonValue,
-            classificationLeaseId: null,
-            classificationLeaseUntil: null
-          }
-        });
-        if (updated.count !== 1) {
-          throw new Error(
-            `Classification lease for communication ${communication.id} was lost.`
-          );
-        }
-
-        await tx.caseEvent.create({
-          data: {
-            caseId: matched.caseId,
-            actorType: "AI",
-            type: CASE_EVENT_TYPES.debtorReplyClassified,
-            note: `Debtor reply classified as ${classification.intent}. No case status was changed automatically.`,
-            payload: {
-              communicationId: communication.id,
-              classification: classification as unknown as Prisma.InputJsonValue
-            }
-          }
-        });
-      });
-    } catch (error) {
-      await prisma.communication
-        .updateMany({
-          where: { id: communication.id, classificationLeaseId },
-          data: {
-            classificationLeaseId: null,
-            classificationLeaseUntil: null
-          }
-        })
-        .catch(() => undefined);
-      throw error;
-    }
-
     return {
       caseId: matched.caseId,
       organizationId: matched.organizationId,
       communicationId: communication.id,
       classification,
-      classificationPending: false,
+      classificationPending: !classification,
       duplicate
     };
+  }
+
+  private async persistAttachments(
+    organizationId: string,
+    caseId: string,
+    communicationId: string,
+    attachments: InboundEmailAttachment[]
+  ): Promise<void> {
+    for (const attachment of attachments) {
+      const sha256 = createHash("sha256")
+        .update(attachment.bytes)
+        .digest("hex");
+      const existing = await prisma.communicationAttachment.findFirst({
+        where: {
+          communicationId,
+          sha256,
+          originalName: attachment.fileName
+        },
+        select: { id: true }
+      });
+      if (existing) {
+        continue;
+      }
+
+      const stored = await this.storage.putObject({
+        organizationId,
+        caseId,
+        fileName: attachment.fileName,
+        contentType: attachment.mimeType,
+        body: attachment.bytes,
+        kind: "communication-attachment"
+      });
+
+      try {
+        await prisma.communicationAttachment.create({
+          data: {
+            communicationId,
+            storageBucket: stored.bucket,
+            storageKey: stored.key,
+            originalName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            sizeBytes: stored.sizeBytes,
+            sha256
+          }
+        });
+      } catch (error) {
+        await this.storage
+          .deleteObject({ bucket: stored.bucket, key: stored.key })
+          .catch(() => undefined);
+        if (isUniqueConstraintViolation(error)) {
+          continue;
+        }
+        throw error;
+      }
+    }
   }
 }
 
@@ -211,7 +193,6 @@ async function resolveInboundReplyCase(email: InboundEmail): Promise<{
   caseId: string;
   organizationId: string;
   debtorEmail: string | null;
-  caseSummary: string;
   correlation: "SIGNED_REPLY_ADDRESS" | "MESSAGE_THREAD";
 } | null> {
   const secret = requireInboundReplyTokenSecret();
@@ -224,10 +205,7 @@ async function resolveInboundReplyCase(email: InboundEmail): Promise<{
 
     const collectionCase = await prisma.case.findUnique({
       where: { id: verified.caseId },
-      include: {
-        debtor: true,
-        events: { orderBy: { createdAt: "desc" }, take: 6 }
-      }
+      include: { debtor: true }
     });
     if (collectionCase) {
       return summarizeMatch(collectionCase, "SIGNED_REPLY_ADDRESS");
@@ -251,10 +229,7 @@ async function resolveInboundReplyCase(email: InboundEmail): Promise<{
     },
     include: {
       case: {
-        include: {
-          debtor: true,
-          events: { orderBy: { createdAt: "desc" }, take: 6 }
-        }
+        include: { debtor: true }
       }
     },
     orderBy: { createdAt: "desc" }
@@ -269,46 +244,40 @@ function summarizeMatch(
   collectionCase: {
     id: string;
     organizationId: string;
-    invoiceNumber: string | null;
-    amountTotal: Prisma.Decimal | null;
-    currency: string | null;
-    dueDate: Date | null;
-    status: string;
-    debtor: { name: string; email: string | null } | null;
-    events: Array<{ type: string; note: string | null }>;
+    debtor: { email: string | null } | null;
   },
   correlation: "SIGNED_REPLY_ADDRESS" | "MESSAGE_THREAD"
 ) {
-  const caseSummary = [
-    `Invoice: ${collectionCase.invoiceNumber ?? "unknown"}`,
-    `Debtor: ${collectionCase.debtor?.name ?? "unknown"}`,
-    `Amount: ${collectionCase.amountTotal?.toString() ?? "unknown"} ${collectionCase.currency ?? ""}`.trim(),
-    `Due date: ${collectionCase.dueDate?.toISOString().slice(0, 10) ?? "unknown"}`,
-    `Current status: ${collectionCase.status}`,
-    ...collectionCase.events.map((event) => `${event.type}: ${event.note ?? ""}`)
-  ].join("\n");
-
   return {
     caseId: collectionCase.id,
     organizationId: collectionCase.organizationId,
     debtorEmail: collectionCase.debtor?.email ?? null,
-    caseSummary,
     correlation
   };
 }
 
-function safeEmailRaw(email: InboundEmail): Prisma.InputJsonObject {
+function safeEmailRaw(
+  email: InboundEmail,
+  rejectedAttachments: RejectedReplyAttachment[]
+): Prisma.InputJsonObject {
   return {
     provider: email.provider,
     providerId: email.providerId,
     messageId: email.messageId,
     inReplyTo: email.inReplyTo,
     references: email.references,
+    autoSubmitted: email.autoSubmitted,
+    precedence: email.precedence,
     from: email.from,
     to: email.to,
     cc: email.cc,
     subject: email.subject,
-    attachmentNames: email.attachments.map((attachment) => attachment.fileName)
+    attachments: email.attachments.map((attachment) => ({
+      fileName: attachment.fileName,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.bytes.byteLength
+    })),
+    rejectedAttachments
   };
 }
 
@@ -330,15 +299,25 @@ function parseStoredClassification(
   return value as unknown as DebtorReplyClassification;
 }
 
+function isAutomatedEmail(email: InboundEmail): boolean {
+  return (
+    (email.autoSubmitted !== null &&
+      email.autoSubmitted !== "no" &&
+      email.autoSubmitted !== "none") ||
+    email.precedence === "bulk" ||
+    email.precedence === "junk" ||
+    email.precedence === "list"
+  );
+}
+
 function normalizeMessageId(value: string | null | undefined): string | null {
   const normalized = value?.trim().replace(/^<|>$/g, "").toLowerCase();
   return normalized || null;
 }
 
-function stripHtml(value: string | null): string {
-  return value?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() ?? "";
-}
-
 function isUniqueConstraintViolation(error: unknown): boolean {
-  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  );
 }

@@ -4,6 +4,7 @@ export type PutObjectInput = {
   fileName: string;
   contentType: string;
   body: Uint8Array;
+  kind?: "invoice" | "communication-attachment";
 };
 
 export type StoredObject = {
@@ -25,7 +26,13 @@ export interface StorageProvider {
   deleteObject(input: { bucket: string; key: string }): Promise<void>;
 }
 
-export function buildCaseObjectKey(input: { organizationId: string; caseId: string; fileName: string }): string {
+export function buildCaseObjectKey(input: {
+  organizationId: string;
+  caseId: string;
+  fileName: string;
+  kind?: "invoice" | "communication-attachment";
+}): string {
   const cleanFileName = input.fileName.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  return `organizations/${input.organizationId}/cases/${input.caseId}/invoice/${Date.now()}-${cleanFileName || "invoice"}`;
+  const kind = input.kind ?? "invoice";
+  return `organizations/${input.organizationId}/cases/${input.caseId}/${kind}/${Date.now()}-${cleanFileName || "file"}`;
 }

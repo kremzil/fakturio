@@ -4,240 +4,114 @@ import {
   type PaymentCheckAction,
   requirePaymentCheckTokenSecret,
   resolvePaymentCheckTransition,
-  verifyPaymentCheckToken
+  verifyPaymentCheckToken,
+  WORKFLOW_COMMAND_TYPES
 } from "@fakturio/shared";
 import { prisma } from "@fakturio/db";
-import { CASE_STATE_CHANGED_COMMAND } from "@fakturio/workflows";
-
-/**
- * Public, token-authorized payment-check flow used from links inside customer emails.
- *
- * These routes are intentionally NOT session-protected: the recipient of the email may not
- * have an active dashboard session. Authorization comes solely from a signed HMAC token bound
- * to { caseId, organizationId, action, expiresAt }.
- *
- * Safety properties:
- *  - GET only renders a landing page and never mutates state (safe against email scanners,
- *    link prefetchers and SafeLinks that auto-issue GET requests).
- *  - POST re-verifies the token and applies the transition atomically.
- *  - Replay safety is state-based idempotency (see resolvePaymentCheckTransition), not a nonce.
- */
+import type { Prisma } from "@prisma/client";
 
 const NO_STORE_HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
   "Cache-Control": "no-store, max-age=0",
   "Referrer-Policy": "no-referrer"
 } as const;
+const TERMINAL_CASE_STATUSES = new Set([
+  "CLOSED_PAID",
+  "CLOSED_CANCELLED",
+  "CLOSED_UNRESOLVED"
+]);
 
-type CaseSummary = {
-  invoiceNumber: string | null;
-  amountTotal: number | null;
-  currency: string | null;
-  debtorName: string | null;
-  dueDate: string | null;
-  status: CaseStatus;
-};
+class PaymentCheckConflictError extends Error {}
 
 const ACTION_COPY: Record<
   PaymentCheckAction,
-  { landingTitle: string; landingLead: string; submitLabel: string; appliedTitle: string; appliedMessage: string; noopMessage: string }
+  {
+    landingTitle: string;
+    landingLead: string;
+    submitLabel: string;
+    appliedTitle: string;
+    appliedMessage: string;
+    noopMessage: string;
+  }
 > = {
   PAID: {
     landingTitle: "Potvrdenie úhrady",
-    landingLead: "Potvrďte, že platba za túto faktúru bola prijatá. Prípad sa uzavrie ako uhradený.",
+    landingLead: "Potvrďte, že očakávaná platba bola prijatá.",
     submitLabel: "Potvrdiť úhradu",
     appliedTitle: "Platba potvrdená",
-    appliedMessage: "Prípad bol uzavretý ako uhradený.",
-    noopMessage: "Prípad už bol uzavretý ako uhradený."
+    appliedMessage: "Platba bola zaevidovaná.",
+    noopMessage: "Táto platba už bola potvrdená."
   },
   NOT_PAID: {
     landingTitle: "Platba neprišla",
-    landingLead: "Potvrďte, že platba zatiaľ neprišla. Prípad sa označí ako po splatnosti a môže pokračovať ďalšími krokmi.",
+    landingLead: "Potvrďte, že očakávaná platba zatiaľ neprišla.",
     submitLabel: "Potvrdiť, že platba neprišla",
-    appliedTitle: "Označené ako po splatnosti",
-    appliedMessage: "Prípad bol označený ako po splatnosti. FAKTURIO môže pokračovať ďalšími krokmi.",
-    noopMessage: "Prípad je už označený ako po splatnosti."
+    appliedTitle: "Neprijatá platba zaevidovaná",
+    appliedMessage: "FAKTURIO bude pokračovať podľa workflow prípadu.",
+    noopMessage: "Neprijatá platba už bola zaevidovaná."
   }
 };
 
-function verifyToken(token: string | null, caseId: string, action: PaymentCheckAction) {
-  if (!token) {
-    return { ok: false as const, reason: "MALFORMED" as const };
-  }
-  const secret = requirePaymentCheckTokenSecret();
-  return verifyPaymentCheckToken(token, secret, { expectedCaseId: caseId, expectedAction: action });
-}
-
-async function loadCaseSummary(caseId: string, organizationId: string): Promise<CaseSummary | null> {
-  const found = await prisma.case.findFirst({
-    where: { id: caseId, organizationId },
-    include: { debtor: true }
-  });
-
-  if (!found) {
-    return null;
-  }
-
-  return {
-    invoiceNumber: found.invoiceNumber,
-    amountTotal: found.amountTotal ? Number(found.amountTotal) : null,
-    currency: found.currency,
-    debtorName: found.debtor?.name ?? null,
-    dueDate: found.dueDate?.toISOString().slice(0, 10) ?? null,
-    status: found.status as CaseStatus
-  };
-}
-
-type ApplyResult =
-  | { outcome: "APPLIED"; status: CaseStatus }
-  | { outcome: "NOOP"; status: CaseStatus }
-  | { outcome: "CONFLICT"; status: CaseStatus; reason: string }
-  | { outcome: "NOT_FOUND" };
-
-async function applyPaymentCheck(caseId: string, organizationId: string, action: PaymentCheckAction): Promise<ApplyResult> {
-  // Optimistic concurrency: two concurrent POSTs (e.g. PAID and NOT_PAID) could both read the
-  // same status and then clobber each other. We guard every write with `status` in the WHERE
-  // clause so a writer only applies the transition it actually resolved from; if a concurrent
-  // commit changed the status first, the conditional update matches 0 rows and we re-resolve.
-  const MAX_ATTEMPTS = 3;
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-    const result = await prisma.$transaction(async (tx) => {
-      const existing = await tx.case.findFirst({
-        where: { id: caseId, organizationId },
-        select: { status: true }
-      });
-
-      if (!existing) {
-        return { outcome: "NOT_FOUND" } as const;
-      }
-
-      const currentStatus = existing.status as CaseStatus;
-      const transition = resolvePaymentCheckTransition(action, currentStatus);
-
-      if (transition.outcome === "NOOP") {
-        return { outcome: "NOOP", status: currentStatus } as const;
-      }
-
-      if (transition.outcome === "CONFLICT") {
-        return { outcome: "CONFLICT", status: currentStatus, reason: transition.reason } as const;
-      }
-
-      const changed = await tx.case.updateMany({
-        where: { id: caseId, organizationId, status: currentStatus },
-        data: scalarMutationForAction(action, transition.nextStatus)
-      });
-
-      if (changed.count === 0) {
-        // Status moved under us between the read and the write — retry with a fresh read.
-        return { outcome: "RETRY" } as const;
-      }
-
-      const auditEvents = eventsForAction(caseId, action);
-      const transitionEvent = await tx.caseEvent.create({ data: auditEvents[0] });
-      if (auditEvents.length > 1) {
-        await tx.caseEvent.createMany({ data: auditEvents.slice(1) });
-      }
-      await tx.workflowCommand.create({
-        data: {
-          caseId,
-          organizationId,
-          type: CASE_STATE_CHANGED_COMMAND,
-          idempotencyKey: `case-event:${transitionEvent.id}`,
-          payload: {
-            status: transition.nextStatus,
-            source: "PAYMENT_CHECK"
-          }
-        }
-      });
-
-      return { outcome: "APPLIED", status: transition.nextStatus } as const;
-    });
-
-    if (result.outcome !== "RETRY") {
-      return result;
-    }
-  }
-
-  // Exhausted retries under sustained contention: report a conflict rather than guessing.
-  return {
-    outcome: "CONFLICT",
-    status: (await loadCaseStatus(caseId, organizationId)) ?? "RECEIVED",
-    reason: "Case was updated concurrently. Please reload and try again."
-  };
-}
-
-async function loadCaseStatus(caseId: string, organizationId: string): Promise<CaseStatus | null> {
-  const found = await prisma.case.findFirst({
-    where: { id: caseId, organizationId },
-    select: { status: true }
-  });
-  return (found?.status as CaseStatus | undefined) ?? null;
-}
-
-function scalarMutationForAction(action: PaymentCheckAction, nextStatus: CaseStatus) {
-  if (action === "PAID") {
-    return { status: nextStatus, closedAt: new Date() };
-  }
-  return { status: nextStatus };
-}
-
-function eventsForAction(caseId: string, action: PaymentCheckAction) {
-  if (action === "PAID") {
-    return [
-      {
-        caseId,
-        actorType: "USER" as const,
-        type: CASE_EVENT_TYPES.paymentReceivedConfirmed,
-        note: "Customer confirmed that payment was received from the payment-check email."
-      }
-    ];
-  }
-
-  return [
-    {
-      caseId,
-      actorType: "USER" as const,
-      type: CASE_EVENT_TYPES.paymentNotReceivedConfirmed,
-      note: "Customer confirmed from the payment-check email that payment was not received."
-    },
-    {
-      caseId,
-      actorType: "WORKFLOW" as const,
-      type: CASE_EVENT_TYPES.workflowWaiting,
-      note: "Case is overdue. Next collection steps can start."
-    }
-  ];
-}
+type LoadedPaymentCheck = NonNullable<
+  Awaited<ReturnType<typeof loadPaymentCheck>>
+>;
+type LegacyCase = NonNullable<Awaited<ReturnType<typeof loadLegacyCase>>>;
 
 export async function handlePaymentCheckGet(
   request: Request,
   caseId: string,
   action: PaymentCheckAction
 ): Promise<Response> {
-  const token = new URL(request.url).searchParams.get("token");
-  const verification = verifyToken(token, caseId, action);
-
+  const verification = verifyToken(request, caseId, action);
   if (!verification.ok) {
-    return page(invalidTokenTitle(verification.reason), invalidTokenMessage(verification.reason), 400);
+    return invalidTokenPage(verification.reason);
   }
 
-  const summary = await loadCaseSummary(caseId, verification.claims.organizationId);
-  if (!summary) {
-    return page("Prípad neexistuje", "Tento prípad sa nenašiel.", 404);
+  if (verification.claims.version === 1) {
+    const legacyCase = await loadLegacyCase(
+      caseId,
+      verification.claims.organizationId
+    );
+    if (!legacyCase) {
+      return page("Prípad neexistuje", "Tento prípad sa nenašiel.", 404);
+    }
+    const copy = ACTION_COPY[action];
+    const token = new URL(request.url).searchParams.get("token")!;
+    return page(
+      copy.landingTitle,
+      `
+        <p>${escapeHtml(copy.landingLead)}</p>
+        ${legacySummaryHtml(legacyCase)}
+        <form method="post" action="${escapeHtml(`?token=${token}`)}">
+          <button type="submit" style="display:inline-block;padding:10px 16px;background:#1d1d1b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px">${escapeHtml(copy.submitLabel)}</button>
+        </form>
+      `,
+      200
+    );
+  }
+
+  const paymentCheck = await loadPaymentCheck(
+    verification.claims.paymentCheckId,
+    caseId,
+    verification.claims.organizationId
+  );
+  if (!paymentCheck) {
+    return page("Kontrola neexistuje", "Táto kontrola platby sa nenašla.", 404);
   }
 
   const copy = ACTION_COPY[action];
-  const body = `
-    <p>${escapeHtml(copy.landingLead)}</p>
-    ${summaryHtml(summary)}
-    <form method="post" action="${escapeHtml(`?token=${token}`)}">
-      <button type="submit" style="display:inline-block;padding:10px 16px;background:#1d1d1b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px">${escapeHtml(
-        copy.submitLabel
-      )}</button>
-    </form>`;
-
-  return page(copy.landingTitle, body, 200);
+  const token = new URL(request.url).searchParams.get("token")!;
+  return page(
+    copy.landingTitle,
+    `
+      <p>${escapeHtml(copy.landingLead)}</p>
+      ${summaryHtml(paymentCheck)}
+      <form method="post" action="${escapeHtml(`?token=${token}`)}">
+        <button type="submit" style="display:inline-block;padding:10px 16px;background:#1d1d1b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px">${escapeHtml(copy.submitLabel)}</button>
+      </form>
+    `,
+    200
+  );
 }
 
 export async function handlePaymentCheckPost(
@@ -245,59 +119,514 @@ export async function handlePaymentCheckPost(
   caseId: string,
   action: PaymentCheckAction
 ): Promise<Response> {
-  const token = new URL(request.url).searchParams.get("token");
-  const verification = verifyToken(token, caseId, action);
-
+  const verification = verifyToken(request, caseId, action);
   if (!verification.ok) {
-    return page(invalidTokenTitle(verification.reason), invalidTokenMessage(verification.reason), 400);
+    return invalidTokenPage(verification.reason);
   }
 
-  const result = await applyPaymentCheck(caseId, verification.claims.organizationId, action);
+  const result =
+    verification.claims.version === 1
+      ? await resolveLegacyPaymentCheck({
+          caseId,
+          organizationId: verification.claims.organizationId,
+          action
+        })
+      : await resolvePaymentCheck({
+          paymentCheckId: verification.claims.paymentCheckId,
+          caseId,
+          organizationId: verification.claims.organizationId,
+          action
+        });
   const copy = ACTION_COPY[action];
 
-  switch (result.outcome) {
-    case "NOT_FOUND":
-      return page("Prípad neexistuje", "Tento prípad sa nenašiel.", 404);
-    case "CONFLICT":
-      return page("Akciu nie je možné vykonať", escapeHtml(result.reason), 409);
-    case "NOOP":
-      return page(copy.appliedTitle, escapeHtml(copy.noopMessage), 200);
-    case "APPLIED":
-    default:
-      return page(copy.appliedTitle, escapeHtml(copy.appliedMessage), 200);
+  if (result === "NOT_FOUND") {
+    return page("Kontrola neexistuje", "Táto kontrola platby sa nenašla.", 404);
+  }
+  if (result === "CONFLICT") {
+    return page(
+      "Kontrola už bola uzavretá",
+      "Táto kontrola už bola vyhodnotená opačným výsledkom.",
+      409
+    );
+  }
+  if (result === "NOOP") {
+    return page(copy.appliedTitle, escapeHtml(copy.noopMessage), 200);
+  }
+  return page(copy.appliedTitle, escapeHtml(copy.appliedMessage), 200);
+}
+
+async function resolveLegacyPaymentCheck(input: {
+  caseId: string;
+  organizationId: string;
+  action: PaymentCheckAction;
+}): Promise<"APPLIED" | "NOOP" | "CONFLICT" | "NOT_FOUND"> {
+  return prisma.$transaction(async (tx) => {
+    const collectionCase = await tx.case.findFirst({
+      where: {
+        id: input.caseId,
+        organizationId: input.organizationId
+      },
+      select: { status: true }
+    });
+    if (!collectionCase) {
+      return "NOT_FOUND";
+    }
+
+    const currentStatus = collectionCase.status as CaseStatus;
+    const transition = resolvePaymentCheckTransition(
+      input.action,
+      currentStatus
+    );
+    if (transition.outcome === "NOOP") {
+      return "NOOP";
+    }
+    if (transition.outcome === "CONFLICT") {
+      return "CONFLICT";
+    }
+
+    const changed = await tx.case.updateMany({
+      where: {
+        id: input.caseId,
+        organizationId: input.organizationId,
+        status: currentStatus
+      },
+      data:
+        input.action === "PAID"
+          ? {
+              status: transition.nextStatus,
+              closedAt: new Date(),
+              nextActionAt: null
+            }
+          : {
+              status: transition.nextStatus,
+              nextActionAt: null
+            }
+    });
+    if (changed.count !== 1) {
+      return "CONFLICT";
+    }
+
+    const event = await tx.caseEvent.create({
+      data: {
+        caseId: input.caseId,
+        actorType: "USER",
+        type:
+          input.action === "PAID"
+            ? CASE_EVENT_TYPES.paymentReceivedConfirmed
+            : CASE_EVENT_TYPES.paymentNotReceivedConfirmed,
+        note: "Customer resolved a legacy payment-check link.",
+        payload: { tokenVersion: 1 }
+      }
+    });
+    await tx.workflowCommand.create({
+      data: {
+        caseId: input.caseId,
+        organizationId: input.organizationId,
+        type: WORKFLOW_COMMAND_TYPES.caseStateChanged,
+        idempotencyKey: `legacy-payment-check:${event.id}`,
+        payload: { status: transition.nextStatus }
+      }
+    });
+    return "APPLIED";
+  });
+}
+
+async function resolvePaymentCheck(input: {
+  paymentCheckId: string;
+  caseId: string;
+  organizationId: string;
+  action: PaymentCheckAction;
+}): Promise<"APPLIED" | "NOOP" | "CONFLICT" | "NOT_FOUND"> {
+  const targetStatus =
+    input.action === "PAID" ? "RESOLVED_PAID" : "RESOLVED_NOT_PAID";
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+    const paymentCheck = await tx.paymentCheck.findFirst({
+      where: {
+        id: input.paymentCheckId,
+        caseId: input.caseId,
+        case: { organizationId: input.organizationId }
+      },
+      include: {
+        case: true,
+        installmentPayment: {
+          include: {
+            plan: {
+              include: {
+                payments: { orderBy: { sequence: "asc" } }
+              }
+            }
+          }
+        }
+      }
+    });
+    if (!paymentCheck) {
+      return "NOT_FOUND";
+    }
+
+    if (
+      paymentCheck.status === "RESOLVED_PAID" ||
+      paymentCheck.status === "RESOLVED_NOT_PAID"
+    ) {
+      return paymentCheck.status === targetStatus ? "NOOP" : "CONFLICT";
+    }
+    if (
+      TERMINAL_CASE_STATUSES.has(paymentCheck.case.status) ||
+      !isPaymentCheckApplicable(paymentCheck)
+    ) {
+      return "CONFLICT";
+    }
+
+    const claimed = await tx.paymentCheck.updateMany({
+      where: {
+        id: paymentCheck.id,
+        status: { in: ["PENDING", "SENT"] },
+        resolvedAt: null
+      },
+      data: { status: targetStatus, resolvedAt: new Date() }
+    });
+    if (claimed.count !== 1) {
+      const current = await tx.paymentCheck.findUniqueOrThrow({
+        where: { id: paymentCheck.id }
+      });
+      return current.status === targetStatus ? "NOOP" : "CONFLICT";
+    }
+
+    if (paymentCheck.installmentPayment) {
+      await resolveInstallmentPayment(
+        tx,
+        {
+          caseId: paymentCheck.caseId,
+          installmentPayment: paymentCheck.installmentPayment
+        },
+        input.action
+      );
+    } else if (input.action === "PAID") {
+      const closed = await tx.case.updateMany({
+        where: {
+          id: paymentCheck.caseId,
+          organizationId: input.organizationId,
+          status: {
+            notIn: ["CLOSED_CANCELLED", "CLOSED_UNRESOLVED"]
+          }
+        },
+        data: {
+          status: "CLOSED_PAID",
+          closedAt: new Date(),
+          nextActionAt: null,
+          automationPausedAt: null,
+          automationPauseReason: null
+        }
+      });
+      assertSingleUpdate(closed.count);
+    } else if (paymentCheck.reason === "DUE_DATE") {
+      const overdue = await tx.case.updateMany({
+        where: {
+          id: paymentCheck.caseId,
+          organizationId: input.organizationId,
+          status: { in: ["WAITING_FOR_DUE_DATE", "DUE_SOON"] }
+        },
+        data: { status: "OVERDUE", nextActionAt: null }
+      });
+      assertSingleUpdate(overdue.count);
+    }
+
+    const event = await tx.caseEvent.create({
+      data: {
+        caseId: paymentCheck.caseId,
+        actorType: "USER",
+        type:
+          input.action === "PAID"
+            ? CASE_EVENT_TYPES.paymentReceivedConfirmed
+            : CASE_EVENT_TYPES.paymentNotReceivedConfirmed,
+        note:
+          input.action === "PAID"
+            ? `Customer confirmed payment check ${paymentCheck.sequence} as paid.`
+            : `Customer confirmed payment check ${paymentCheck.sequence} as not paid.`,
+        payload: {
+          paymentCheckId: paymentCheck.id,
+          reason: paymentCheck.reason,
+          installmentPaymentId: paymentCheck.installmentPaymentId
+        }
+      }
+    });
+    await tx.workflowCommand.create({
+      data: {
+        caseId: paymentCheck.caseId,
+        organizationId: input.organizationId,
+        type: WORKFLOW_COMMAND_TYPES.paymentCheckResolved,
+        idempotencyKey: `payment-check-result:${event.id}`,
+        payload: { paymentCheckId: paymentCheck.id }
+      }
+    });
+
+      return "APPLIED";
+    });
+    if (result === "CONFLICT") {
+      return normalizeConcurrentPaymentCheckResult(input, targetStatus);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof PaymentCheckConflictError) {
+      return normalizeConcurrentPaymentCheckResult(input, targetStatus);
+    }
+    throw error;
   }
 }
 
-function summaryHtml(summary: CaseSummary): string {
-  const amount =
-    summary.amountTotal !== null ? `${summary.amountTotal.toFixed(2)} ${summary.currency ?? ""}`.trim() : "nezistená suma";
+async function normalizeConcurrentPaymentCheckResult(
+  input: {
+    paymentCheckId: string;
+    caseId: string;
+    organizationId: string;
+  },
+  targetStatus: "RESOLVED_PAID" | "RESOLVED_NOT_PAID"
+): Promise<"NOOP" | "CONFLICT"> {
+  const current = await prisma.paymentCheck.findFirst({
+    where: {
+      id: input.paymentCheckId,
+      caseId: input.caseId,
+      case: { organizationId: input.organizationId }
+    },
+    select: { status: true }
+  });
+  return current?.status === targetStatus ? "NOOP" : "CONFLICT";
+}
+
+async function resolveInstallmentPayment(
+  tx: Prisma.TransactionClient,
+  paymentCheck: {
+    caseId: string;
+    installmentPayment: {
+      id: string;
+      sequence: number;
+      planId: string;
+      plan: {
+        payments: Array<{
+          id: string;
+          status: string;
+          dueDate: Date;
+        }>;
+      };
+    };
+  },
+  action: PaymentCheckAction
+): Promise<void> {
+  const installment = paymentCheck.installmentPayment;
+  if (action === "NOT_PAID") {
+    const missed = await tx.installmentPayment.updateMany({
+      where: { id: installment.id, status: "PENDING" },
+      data: { status: "MISSED", missedAt: new Date() }
+    });
+    const broken = await tx.installmentPlan.updateMany({
+      where: { id: installment.planId, status: "ACTIVE" },
+      data: { status: "BROKEN", brokenAt: new Date() }
+    });
+    const caseBroken = await tx.case.updateMany({
+      where: {
+        id: paymentCheck.caseId,
+        status: "INSTALLMENT_ACTIVE"
+      },
+      data: {
+        status: "INSTALLMENT_BROKEN",
+        nextActionAt: null
+      }
+    });
+    assertSingleUpdate(missed.count, broken.count, caseBroken.count);
+    await tx.caseEvent.create({
+      data: {
+        caseId: paymentCheck.caseId,
+        actorType: "USER",
+        type: CASE_EVENT_TYPES.installmentBroken,
+        note: `${installment.sequence}. installment was not received.`,
+        payload: {
+          planId: installment.planId,
+          installmentPaymentId: installment.id
+        }
+      }
+    });
+    return;
+  }
+
+  const paid = await tx.installmentPayment.updateMany({
+    where: { id: installment.id, status: "PENDING" },
+    data: { status: "PAID", paidAt: new Date() }
+  });
+  const nextPayment = installment.plan.payments.find(
+    (payment) =>
+      payment.id !== installment.id && payment.status === "PENDING"
+  );
+  if (!nextPayment) {
+    const completed = await tx.installmentPlan.updateMany({
+      where: { id: installment.planId, status: "ACTIVE" },
+      data: { status: "COMPLETED", completedAt: new Date() }
+    });
+    const closed = await tx.case.updateMany({
+      where: {
+        id: paymentCheck.caseId,
+        status: "INSTALLMENT_ACTIVE"
+      },
+      data: {
+        status: "CLOSED_PAID",
+        closedAt: new Date(),
+        nextActionAt: null
+      }
+    });
+    assertSingleUpdate(paid.count, completed.count, closed.count);
+  } else {
+    const advanced = await tx.case.updateMany({
+      where: {
+        id: paymentCheck.caseId,
+        status: "INSTALLMENT_ACTIVE"
+      },
+      data: {
+        status: "INSTALLMENT_ACTIVE",
+        nextActionAt: nextPayment.dueDate
+      }
+    });
+    assertSingleUpdate(paid.count, advanced.count);
+  }
+  await tx.caseEvent.create({
+    data: {
+      caseId: paymentCheck.caseId,
+      actorType: "USER",
+      type: CASE_EVENT_TYPES.installmentPaymentConfirmed,
+      note: `${installment.sequence}. installment was confirmed as paid.`,
+      payload: {
+        planId: installment.planId,
+        installmentPaymentId: installment.id
+      }
+    }
+  });
+}
+
+function isPaymentCheckApplicable(paymentCheck: {
+  reason: string;
+  case: { status: string };
+  installmentPayment: null | {
+    status: string;
+    plan: { status: string };
+  };
+}): boolean {
+  if (paymentCheck.installmentPayment) {
+    return (
+      paymentCheck.case.status === "INSTALLMENT_ACTIVE" &&
+      paymentCheck.installmentPayment.status === "PENDING" &&
+      paymentCheck.installmentPayment.plan.status === "ACTIVE"
+    );
+  }
+
+  switch (paymentCheck.reason) {
+    case "DUE_DATE":
+      return (
+        paymentCheck.case.status === "WAITING_FOR_DUE_DATE" ||
+        paymentCheck.case.status === "DUE_SOON"
+      );
+    case "FOLLOW_UP":
+      return paymentCheck.case.status === "EMAIL_REMINDER_1_SENT";
+    case "PROMISE_DUE":
+      return paymentCheck.case.status === "PAYMENT_PROMISED";
+    case "DEBTOR_CLAIMED_PAID":
+      return !TERMINAL_CASE_STATUSES.has(paymentCheck.case.status);
+    default:
+      return false;
+  }
+}
+
+function assertSingleUpdate(...counts: number[]): void {
+  if (counts.some((count) => count !== 1)) {
+    throw new PaymentCheckConflictError(
+      "Payment check state changed concurrently."
+    );
+  }
+}
+
+function verifyToken(
+  request: Request,
+  caseId: string,
+  action: PaymentCheckAction
+) {
+  const token = new URL(request.url).searchParams.get("token");
+  if (!token) {
+    return { ok: false as const, reason: "MALFORMED" as const };
+  }
+  return verifyPaymentCheckToken(
+    token,
+    requirePaymentCheckTokenSecret(),
+    { expectedCaseId: caseId, expectedAction: action }
+  );
+}
+
+async function loadPaymentCheck(
+  paymentCheckId: string,
+  caseId: string,
+  organizationId: string
+) {
+  return prisma.paymentCheck.findFirst({
+    where: {
+      id: paymentCheckId,
+      caseId,
+      case: { organizationId }
+    },
+    include: {
+      case: { include: { debtor: true } },
+      installmentPayment: true
+    }
+  });
+}
+
+async function loadLegacyCase(caseId: string, organizationId: string) {
+  return prisma.case.findFirst({
+    where: { id: caseId, organizationId },
+    include: { debtor: true }
+  });
+}
+
+function legacySummaryHtml(collectionCase: LegacyCase): string {
+  const amount = collectionCase.amountTotal
+    ? `${Number(collectionCase.amountTotal).toFixed(2)} ${collectionCase.currency ?? ""}`.trim()
+    : "nezistená suma";
   return `
     <table style="border-collapse:collapse;margin:16px 0">
-      <tr><td style="padding:2px 12px 2px 0;color:#666">Faktúra</td><td>${escapeHtml(summary.invoiceNumber ?? "—")}</td></tr>
-      <tr><td style="padding:2px 12px 2px 0;color:#666">Odberateľ</td><td>${escapeHtml(summary.debtorName ?? "—")}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Faktúra</td><td>${escapeHtml(collectionCase.invoiceNumber ?? "—")}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Dlžník</td><td>${escapeHtml(collectionCase.debtor?.name ?? "—")}</td></tr>
       <tr><td style="padding:2px 12px 2px 0;color:#666">Suma</td><td>${escapeHtml(amount)}</td></tr>
-      <tr><td style="padding:2px 12px 2px 0;color:#666">Splatnosť</td><td>${escapeHtml(summary.dueDate ?? "—")}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Splatnosť</td><td>${escapeHtml(collectionCase.dueDate?.toISOString().slice(0, 10) ?? "—")}</td></tr>
     </table>`;
 }
 
-function invalidTokenTitle(reason: string): string {
-  return reason === "EXPIRED" ? "Odkaz expiroval" : "Neplatný odkaz";
+function summaryHtml(paymentCheck: LoadedPaymentCheck): string {
+  const amount = paymentCheck.expectedAmount
+    ? `${Number(paymentCheck.expectedAmount).toFixed(2)} ${paymentCheck.currency ?? ""}`.trim()
+    : "nezistená suma";
+  const label = paymentCheck.installmentPayment
+    ? `${paymentCheck.installmentPayment.sequence}. splátka`
+    : paymentCheck.case.invoiceNumber ?? "—";
+  const dueDate =
+    paymentCheck.installmentPayment?.dueDate ??
+    paymentCheck.case.dueDate;
+  return `
+    <table style="border-collapse:collapse;margin:16px 0">
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Platba</td><td>${escapeHtml(label)}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Dlžník</td><td>${escapeHtml(paymentCheck.case.debtor?.name ?? "—")}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Suma</td><td>${escapeHtml(amount)}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Termín</td><td>${escapeHtml(dueDate?.toISOString().slice(0, 10) ?? "—")}</td></tr>
+    </table>`;
 }
 
-function invalidTokenMessage(reason: string): string {
-  if (reason === "EXPIRED") {
-    return "Platnosť tohto odkazu uplynula. Otvorte FAKTURIO a aktualizujte stav prípadu manuálne.";
-  }
-  return "Tento odkaz nie je platný. Otvorte FAKTURIO a aktualizujte stav prípadu manuálne.";
+function invalidTokenPage(reason: string): Response {
+  return page(
+    reason === "EXPIRED" ? "Odkaz expiroval" : "Neplatný odkaz",
+    reason === "EXPIRED"
+      ? "Platnosť tohto odkazu uplynula. Stav aktualizujte vo FAKTURIO."
+      : "Tento odkaz nie je platný.",
+    400
+  );
 }
 
 function page(title: string, bodyHtml: string, status: number): Response {
   return new Response(
-    `<!doctype html><html lang="sk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>${escapeHtml(
-      title
-    )}</title><style>body{font-family:Arial,sans-serif;margin:48px;color:#1d1d1b;max-width:560px}a{color:#1d1d1b}</style></head><body><h1>${escapeHtml(
-      title
-    )}</h1>${bodyHtml}<p style="margin-top:24px"><a href="/">Späť do FAKTURIO</a></p></body></html>`,
+    `<!doctype html><html lang="sk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>${escapeHtml(title)}</title><style>body{font-family:Arial,sans-serif;margin:48px;color:#1d1d1b;max-width:560px}a{color:#1d1d1b}</style></head><body><h1>${escapeHtml(title)}</h1>${bodyHtml}<p style="margin-top:24px"><a href="/">Späť do FAKTURIO</a></p></body></html>`,
     { status, headers: NO_STORE_HEADERS }
   );
 }

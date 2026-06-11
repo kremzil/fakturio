@@ -27,6 +27,8 @@ export type InboundEmail = {
   messageId: string | null;
   inReplyTo: string | null;
   references: string[];
+  autoSubmitted: string | null;
+  precedence: string | null;
   from: string;
   to: string[];
   cc: string[];

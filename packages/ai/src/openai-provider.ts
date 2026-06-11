@@ -79,11 +79,11 @@ export class OpenAiProvider implements AiProvider {
         {
           role: "system",
           content:
-            "Classify debtor replies for a Slovak soft-collection workflow. Never approve discounts, legal action, or non-standard terms. Return structured classification only."
+            "Classify debtor replies for a Slovak soft-collection workflow. Distinguish payment claims, concrete payment promises, disputes, installment requests, explicit acceptance or rejection of a previously proposed installment schedule, automated replies, and unclear messages. explicitInstallmentAcceptance may be true only when the debtor unambiguously accepts all proposed dates and amounts shown in the case summary. Extract a mentioned payment amount only when explicit. Never approve discounts, legal action, or non-standard terms. Return structured classification only."
         },
         {
           role: "user",
-          content: `Case summary:\n${input.latestCaseSummary ?? "(none)"}\n\nDebtor reply:\n${input.messageText}`
+          content: `Case summary and any proposed installment schedule:\n${input.latestCaseSummary ?? "(none)"}\n\nDebtor reply:\n${input.messageText}`
         }
       ],
       text: {

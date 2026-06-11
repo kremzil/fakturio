@@ -21,6 +21,8 @@ export class FixtureEmailProvider implements EmailProvider {
       messageId: candidate.messageId ?? null,
       inReplyTo: candidate.inReplyTo ?? null,
       references: candidate.references ?? [],
+      autoSubmitted: candidate.autoSubmitted ?? null,
+      precedence: candidate.precedence ?? null,
       from: candidate.from ?? "debtor@example.com",
       to: candidate.to ?? ["system@example.com"],
       cc: candidate.cc ?? [],

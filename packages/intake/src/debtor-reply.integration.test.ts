@@ -1,12 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { prisma } from "@fakturio/db";
-import { MockAiProvider } from "@fakturio/ai";
 import {
   CASE_EVENT_TYPES,
   createCaseReplyAddress,
-  requireInboundReplyTokenSecret
+  requireInboundReplyTokenSecret,
+  WORKFLOW_COMMAND_TYPES
 } from "@fakturio/shared";
 import type { InboundEmail } from "@fakturio/email";
+import type { StorageProvider } from "@fakturio/storage";
 import { DebtorReplyService } from "./debtor-reply";
 
 const RUN_ID = `it-reply-${Date.now()}-${Math.floor(Math.random() * 1e5)}`;
@@ -31,7 +32,7 @@ beforeAll(async () => {
       id: caseId,
       organizationId,
       debtorId,
-      status: "OVERDUE",
+      status: "EMAIL_REMINDER_1_SENT",
       invoiceNumber: "INV-REPLY-1",
       amountTotal: 100,
       currency: "EUR",
@@ -45,8 +46,8 @@ afterAll(async () => {
   await prisma.$disconnect();
 });
 
-describe("inbound debtor replies", () => {
-  it("correlates a signed reply address, classifies once and never closes the case", async () => {
+describe("inbound debtor reply intake", () => {
+  it("stores once and enqueues classification for Temporal", async () => {
     const replyAddress = createCaseReplyAddress(
       { caseId, domain: "reply.example.com" },
       requireInboundReplyTokenSecret()
@@ -56,7 +57,7 @@ describe("inbound debtor replies", () => {
       to: [replyAddress],
       textBody: "Faktúra bola uhradená."
     });
-    const service = new DebtorReplyService(new MockAiProvider());
+    const service = new DebtorReplyService();
 
     const first = await service.process(email);
     const second = await service.process(email);
@@ -65,36 +66,35 @@ describe("inbound debtor replies", () => {
       caseId,
       organizationId,
       duplicate: false,
-      classification: { intent: "PAID" }
+      classification: null,
+      classificationPending: true
     });
     expect(second).toMatchObject({
       caseId,
       duplicate: true,
-      classification: { intent: "PAID" }
+      classificationPending: true
     });
-
-    const collectionCase = await prisma.case.findUniqueOrThrow({
-      where: { id: caseId }
-    });
-    expect(collectionCase.status).toBe("OVERDUE");
-
     expect(
       await prisma.communication.count({
+        where: { caseId, providerId: email.providerId }
+      })
+    ).toBe(1);
+    expect(
+      await prisma.workflowCommand.count({
         where: {
           caseId,
-          direction: "INBOUND",
-          providerId: email.providerId
+          type: WORKFLOW_COMMAND_TYPES.debtorReplyReceived
         }
       })
     ).toBe(1);
     expect(
       await prisma.caseEvent.count({
-        where: { caseId, type: CASE_EVENT_TYPES.debtorReplyClassified }
+        where: { caseId, type: CASE_EVENT_TYPES.emailReceived }
       })
     ).toBe(1);
   });
 
-  it("correlates standard email thread headers to an outbound communication", async () => {
+  it("correlates standard thread headers to an outbound communication", async () => {
     const outboundMessageId = `${RUN_ID}-outbound@example.com`;
     await prisma.communication.create({
       data: {
@@ -108,69 +108,129 @@ describe("inbound debtor replies", () => {
         sentAt: new Date()
       }
     });
-    const email = inboundEmail({
-      providerId: `${RUN_ID}-message-2`,
-      to: ["collections@example.com"],
-      inReplyTo: `<${outboundMessageId}>`,
-      references: [`<${outboundMessageId}>`],
-      textBody: "Zaplatíme budúci týždeň."
-    });
-
-    const result = await new DebtorReplyService(new MockAiProvider()).process(email);
-
-    expect(result).toMatchObject({
-      caseId,
-      classification: { intent: "PROMISED_TO_PAY" }
-    });
+    const result = await new DebtorReplyService().process(
+      inboundEmail({
+        providerId: `${RUN_ID}-message-2`,
+        to: ["collections@example.com"],
+        inReplyTo: `<${outboundMessageId}>`,
+        references: [`<${outboundMessageId}>`],
+        textBody: "Zaplatíme budúci týždeň."
+      })
+    );
+    expect(result).toMatchObject({ caseId, classificationPending: true });
   });
 
-  it("allows only one concurrent AI classification for the same provider message", async () => {
+  it("stores reply attachments once without treating them as payment proof", async () => {
+    const storedKeys: string[] = [];
+    const storage: StorageProvider = {
+      async putObject(input) {
+        const key = `test/${input.kind}/${input.fileName}`;
+        storedKeys.push(key);
+        return {
+          bucket: "test-bucket",
+          key,
+          sizeBytes: input.body.byteLength,
+          contentType: input.contentType
+        };
+      },
+      async getSignedUrl() {
+        return "https://example.test/attachment";
+      },
+      async deleteObject() {}
+    };
     const replyAddress = createCaseReplyAddress(
       { caseId, domain: "reply.example.com" },
       requireInboundReplyTokenSecret()
     );
     const email = inboundEmail({
-      providerId: `${RUN_ID}-message-3`,
+      providerId: `${RUN_ID}-message-with-attachment`,
       to: [replyAddress],
-      textBody: "Faktúra bola uhradená."
+      textBody: "Doklad prikladám.",
+      attachments: [
+        {
+          fileName: "doklad.pdf",
+          mimeType: "application/pdf",
+          bytes: new Uint8Array([1, 2, 3])
+        }
+      ]
     });
-    let classifications = 0;
-    class SlowMockAiProvider extends MockAiProvider {
-      override async classifyDebtorReply(input: Parameters<MockAiProvider["classifyDebtorReply"]>[0]) {
-        classifications += 1;
-        await new Promise((resolve) => setTimeout(resolve, 75));
-        return super.classifyDebtorReply(input);
-      }
-    }
-    const service = new DebtorReplyService(new SlowMockAiProvider());
-    const beforeEvents = await prisma.caseEvent.count({
-      where: { caseId, type: CASE_EVENT_TYPES.debtorReplyClassified }
-    });
+    const service = new DebtorReplyService(storage);
 
-    const results = await Promise.all([
-      service.process(email),
-      service.process(email)
-    ]);
+    const first = await service.process(email);
+    const second = await service.process(email);
 
-    expect(classifications).toBe(1);
-    expect(results.some((result) => result?.classificationPending)).toBe(true);
+    expect(first?.classificationPending).toBe(true);
+    expect(second?.duplicate).toBe(true);
+    expect(storedKeys).toHaveLength(1);
     expect(
-      await prisma.caseEvent.count({
-        where: { caseId, type: CASE_EVENT_TYPES.debtorReplyClassified }
+      await prisma.communicationAttachment.count({
+        where: { communicationId: first?.communicationId }
       })
-    ).toBe(beforeEvents + 1);
+    ).toBe(1);
+  });
+
+  it("does not store unsupported or oversized reply attachments", async () => {
+    const storedNames: string[] = [];
+    const storage: StorageProvider = {
+      async putObject(input) {
+        storedNames.push(input.fileName);
+        return {
+          bucket: "test-bucket",
+          key: `test/${input.fileName}`,
+          sizeBytes: input.body.byteLength,
+          contentType: input.contentType
+        };
+      },
+      async getSignedUrl() {
+        return "https://example.test/attachment";
+      },
+      async deleteObject() {}
+    };
+    const replyAddress = createCaseReplyAddress(
+      { caseId, domain: "reply.example.com" },
+      requireInboundReplyTokenSecret()
+    );
+    const result = await new DebtorReplyService(storage).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-message-rejected-attachments`,
+        to: [replyAddress],
+        attachments: [
+          {
+            fileName: "payload.exe",
+            mimeType: "application/octet-stream",
+            bytes: new Uint8Array([1])
+          },
+          {
+            fileName: "oversized.pdf",
+            mimeType: "application/pdf",
+            bytes: new Uint8Array(10 * 1024 * 1024 + 1)
+          }
+        ]
+      })
+    );
+
+    expect(storedNames).toEqual([]);
+    const communication = await prisma.communication.findUniqueOrThrow({
+      where: { id: result!.communicationId }
+    });
+    expect(communication.rawPayload).toMatchObject({
+      rejectedAttachments: [
+        { fileName: "payload.exe", reason: "UNSUPPORTED_TYPE" },
+        { fileName: "oversized.pdf", reason: "FILE_TOO_LARGE" }
+      ]
+    });
   });
 });
 
-function inboundEmail(
-  overrides: Partial<InboundEmail>
-): InboundEmail {
+function inboundEmail(overrides: Partial<InboundEmail>): InboundEmail {
   return {
     provider: "fixture",
     providerId: `${RUN_ID}-message`,
     messageId: null,
     inReplyTo: null,
     references: [],
+    autoSubmitted: null,
+    precedence: null,
     from: "debtor@example.com",
     to: [],
     cc: [],

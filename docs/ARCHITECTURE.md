@@ -70,11 +70,13 @@ Case state changes that must wake a workflow are written to `WorkflowCommand` in
 
 Temporal uses separate local databases (`temporal`, `temporal_visibility`) from the application database (`fakturio`) so Prisma migrations only manage application tables.
 
+Workflow changes that alter command names, timers or activity ordering require a replay-compatible rollout. Patch `case-collection-loop-v1` preserves the pre-change execution path while new executions use the interruptible collection loop. Patch `overdue-reminder-loop-guard-v1` adds the post-reminder state verification without changing replay of executions that already passed that branch. During the rollout, the dispatcher sends `caseCommand` and also sends legacy `caseStateChanged` for case-state commands. Legacy branches stay deployed until all pre-patch executions complete or are explicitly migrated. Their removal requires a `deprecatePatch` deployment followed by a separate cleanup deployment. Replay tests against captured legacy history are required before either rollout step.
+
 ## Payment Check Workflow
 
 Confirming a reviewed invoice sets the case to `WAITING_FOR_DUE_DATE` and records a workflow start request. The worker scans confirmed cases without `workflowId`, starts `caseWorkflow`, and stores the deterministic workflow id `case-{caseId}`.
 
-`caseWorkflow` waits until the invoice due date. On that date, if the case is still waiting, the worker sends a payment-check email to the customer account user through `EmailProvider`:
+`caseWorkflow` waits until the invoice due date and then remains active until a terminal case status. Timers and durable signals are handled in the same deterministic loop. On a control date, the worker creates a concrete `PaymentCheck` and sends its actions to the customer account user through `EmailProvider`:
 
 - `EMAIL_DRIVER=mailpit` locally writes to Mailpit SMTP.
 - `EMAIL_DRIVER=ses` uses Amazon SES in production.
@@ -84,7 +86,9 @@ The email contains two action links:
 - `/api/cases/:caseId/payment-check/paid` closes the case as `CLOSED_PAID`.
 - `/api/cases/:caseId/payment-check/not-paid` marks the case `OVERDUE` and records that collection can continue.
 
-The links carry time-limited HMAC tokens bound to the case, organization and action. `GET` only renders a read-only confirmation page so email scanners and link previews cannot mutate state. The transition is applied only by an explicit token-authorized `POST`, using an optimistic conditional update so concurrent/replayed actions cannot regress the case.
+The links carry time-limited HMAC tokens bound to the payment check, case, organization and action. `GET` only renders a read-only confirmation page so email scanners and link previews cannot mutate state. The transition is applied only by an explicit token-authorized `POST`, using an atomic claim so concurrent/replayed actions resolve one check once.
+
+Token version 2 binds actions to a concrete `PaymentCheck`. The verifier also accepts legacy version 1 tokens until all already-issued links have expired, but the signer emits only version 2. Terminal cases and payment checks whose expected case/plan/installment state no longer matches are rejected before mutation.
 
 Payment-check delivery uses `Communication` as a durable outbox:
 
@@ -93,6 +97,10 @@ Payment-check delivery uses `Communication` as a durable outbox:
 - Retry reclaim refreshes the stored recipient, body and action tokens before sending.
 - Marking the communication `SENT` and recording the audit `CaseEvent` happen in one transaction.
 - Activity timeout and lease TTL are shared workflow constants; the lease includes a grace interval beyond the Temporal timeout.
+
+When the customer explicitly selects `NOT_PAID`, the case moves to `OVERDUE` and the workflow immediately sends the first debtor reminder. The reminder is deterministic template content built from reviewed case data and does not use AI. Its requested payment date defaults to 10 calendar days after sending and is configurable through `DEBTOR_FIRST_REMINDER_PAYMENT_DAYS`.
+
+The reminder uses its own durable `Communication` idempotency key and send lease. Immediately before calling the provider, the activity verifies that the organization-scoped case is still `OVERDUE`. A successful transactional confirmation advances it to `EMAIL_REMINDER_1_SENT` and records `EMAIL_SENT`. A missing debtor or customer email atomically pauses automation with a reason and clears `nextActionAt`, preventing a retry hot loop.
 
 ## Inbound Email And Reply Classification
 
@@ -104,6 +112,16 @@ Inbound processing order:
 2. Match `In-Reply-To` or `References` to a stored outbound `Communication`.
 3. Otherwise resolve an active organization `EmailIntakeAddress` and process the message as invoice intake.
 
-Replies are idempotent by provider message id, stored as `Communication(INBOUND)`, classified through `AiProvider`, and added to the case timeline. Classification never changes the debt amount or closes the case automatically. Replayed invoice messages are deduplicated per provider message and attachment hash.
+Replies are idempotent by provider message id. Web intake stores `Communication(INBOUND)`, accepted `CommunicationAttachment` objects and a `DEBTOR_REPLY_RECEIVED` command without calling AI. Reply attachments are limited to 10 files, 10 MB each and 20 MB total, with PDF/JPEG/PNG/WEBP allowlisted. Rejected attachment metadata remains in the communication audit payload, but rejected bytes are not written to storage. The worker classifies readable text through `AiProvider` and applies deterministic policy. Attachments are retained for audit but never treated as proof of payment.
 
-The signed address codec and correlation path are implemented. Wiring that address into `Reply-To` belongs to the next outbound debtor-reminder step; current payment-check messages are sent to the customer account user and use signed HTTP actions.
+Sender mismatch and automated replies are recorded and ignored. Low-confidence, contradictory, invalid-date and repeated unclear replies pause or request clarification. AI never changes a debt amount: a partial or different amount forces manual review. A debtor payment claim creates a new customer `PaymentCheck`; only the customer response can close the case.
+
+The first accepted payment promise may move the next check by at most ten calendar days. Further promises do not extend it. Disputes notify the customer and pause automation.
+
+## Installment Plans
+
+A standard plan is deterministic and pre-authorized: three installments due `+5`, `+19` and `+33` calendar days after explicit acceptance. Proposal dates are shown to the debtor, but persisted due dates are recalculated atomically from the actual acceptance time so a delayed reply cannot activate an already-due first installment. The first two amounts use `floor(total cents / 3)` and the final amount closes the rounding remainder.
+
+`InstallmentPlan` and `InstallmentPayment` are persisted only after the proposal flow. Temporal waits for each payment due date and creates a dedicated `PaymentCheck`. Confirmed payments advance to the next installment; the third closes the case. A missed installment marks the plan and case broken, sends template notices, and creates an idempotent `CALL_REQUIRED` timeline event for a future voice adapter.
+
+The first debtor reminder uses the signed case-specific address as `Reply-To`, while payment-check messages sent to the customer account user continue to use signed HTTP actions.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { normalizeParty, normalizeSearchText } from "./counterparty-resolver";
 import { normalizeEmailAddress } from "./email-routing";
 import { validateAttachment } from "./service";
+import { selectReplyAttachments } from "./reply-attachment-policy";
 
 describe("invoice intake", () => {
   it("accepts PDF and image invoice attachments", () => {
@@ -39,5 +40,39 @@ describe("invoice intake", () => {
 
   it("normalizes inbound email routing addresses", () => {
     expect(normalizeEmailAddress(" Invoices@FAKTURIO.Local ")).toBe("invoices@fakturio.local");
+  });
+
+  it("limits debtor reply attachments by type, count and byte budget", () => {
+    const attachment = (
+      fileName: string,
+      mimeType: string,
+      size: number
+    ) => ({
+      fileName,
+      mimeType,
+      bytes: new Uint8Array(size)
+    });
+    const result = selectReplyAttachments(
+      [
+        attachment("proof.pdf", "application/pdf", 4),
+        attachment("script.exe", "application/octet-stream", 1),
+        attachment("large.png", "image/png", 6),
+        attachment("extra.jpg", "image/jpeg", 1)
+      ],
+      {
+        maxAttachments: 3,
+        maxAttachmentBytes: 5,
+        maxTotalBytes: 5
+      }
+    );
+
+    expect(result.accepted.map(({ fileName }) => fileName)).toEqual([
+      "proof.pdf"
+    ]);
+    expect(result.rejected.map(({ reason }) => reason)).toEqual([
+      "UNSUPPORTED_TYPE",
+      "FILE_TOO_LARGE",
+      "TOO_MANY_ATTACHMENTS"
+    ]);
   });
 });

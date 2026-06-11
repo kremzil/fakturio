@@ -9,6 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@fakturio/ai": "0.2.0",
     "@fakturio/db": "0.2.0",
     "@fakturio/email": "0.2.0",
     "@fakturio/shared": "0.2.0",

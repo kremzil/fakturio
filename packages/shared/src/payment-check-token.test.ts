@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createPaymentCheckToken,
@@ -11,6 +12,7 @@ const FUTURE = Date.now() + 60_000;
 function baseToken(overrides: Partial<{ caseId: string; organizationId: string; action: "PAID" | "NOT_PAID"; expiresAt: number }> = {}) {
   return createPaymentCheckToken(
     {
+      paymentCheckId: "check-1",
       caseId: overrides.caseId ?? "case-1",
       organizationId: overrides.organizationId ?? "org-1",
       action: overrides.action ?? "PAID",
@@ -31,9 +33,36 @@ describe("payment-check token", () => {
         organizationId: "org-1",
         action: "PAID",
         purpose: "payment-check",
-        version: 1
+        version: 2
       });
     }
+  });
+
+  it("continues to verify previously issued version 1 tokens", () => {
+    const token = legacyToken({
+      caseId: "case-1",
+      organizationId: "org-1",
+      action: "PAID",
+      expiresAt: FUTURE
+    });
+    const result = verifyPaymentCheckToken(token, SECRET);
+
+    expect(result).toEqual({
+      ok: true,
+      claims: {
+        version: 1,
+        purpose: "payment-check",
+        caseId: "case-1",
+        organizationId: "org-1",
+        action: "PAID",
+        expiresAt: FUTURE
+      }
+    });
+    expect(
+      verifyPaymentCheckToken(token, SECRET, {
+        expectedPaymentCheckId: "check-1"
+      })
+    ).toEqual({ ok: false, reason: "PAYMENT_CHECK_MISMATCH" });
   });
 
   it("rejects a token signed with a different secret", () => {
@@ -84,9 +113,29 @@ describe("payment-check token", () => {
   });
 
   it("requires a sufficiently long secret", () => {
-    expect(() => createPaymentCheckToken({ caseId: "c", organizationId: "o", action: "PAID", expiresAt: FUTURE }, "short")).toThrow();
+    expect(() => createPaymentCheckToken({ paymentCheckId: "pc", caseId: "c", organizationId: "o", action: "PAID", expiresAt: FUTURE }, "short")).toThrow();
   });
 });
+
+function legacyToken(input: {
+  caseId: string;
+  organizationId: string;
+  action: "PAID" | "NOT_PAID";
+  expiresAt: number;
+}): string {
+  const payload = Buffer.from(
+    JSON.stringify({
+      version: 1,
+      purpose: "payment-check",
+      ...input
+    }),
+    "utf8"
+  ).toString("base64url");
+  const signature = createHmac("sha256", SECRET)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${signature}`;
+}
 
 describe("payment-check state-based idempotency", () => {
   it("PAID closes an active case as CLOSED_PAID", () => {

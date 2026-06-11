@@ -42,6 +42,8 @@ describe("email invoice intake idempotency", () => {
       messageId: `${RUN_ID}-message@example.com`,
       inReplyTo: null,
       references: [],
+      autoSubmitted: null,
+      precedence: null,
       from: "supplier@example.com",
       to: ["invoices@example.com"],
       cc: [],

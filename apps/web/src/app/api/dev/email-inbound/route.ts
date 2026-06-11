@@ -16,6 +16,8 @@ const inboundEmailFixtureSchema = z.object({
   messageId: z.string().nullable().default(null),
   inReplyTo: z.string().nullable().default(null),
   references: z.array(z.string()).default([]),
+  autoSubmitted: z.string().nullable().default(null),
+  precedence: z.string().nullable().default(null),
   from: z.string().email().default("sender@example.com"),
   to: z.array(z.string()).default(["invoices@fakturio.local"]),
   cc: z.array(z.string()).default([]),

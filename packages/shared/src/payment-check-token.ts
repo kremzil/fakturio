@@ -1,13 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { CaseStatus } from "./case-status";
 
-export const PAYMENT_CHECK_TOKEN_VERSION = 1;
+export const PAYMENT_CHECK_TOKEN_VERSION = 2;
 export const PAYMENT_CHECK_TOKEN_PURPOSE = "payment-check" as const;
 
 export type PaymentCheckAction = "PAID" | "NOT_PAID";
 
-export type PaymentCheckTokenClaims = {
-  version: number;
+type PaymentCheckTokenClaimsBase = {
   purpose: typeof PAYMENT_CHECK_TOKEN_PURPOSE;
   caseId: string;
   organizationId: string;
@@ -15,7 +14,21 @@ export type PaymentCheckTokenClaims = {
   expiresAt: number;
 };
 
+export type LegacyPaymentCheckTokenClaims = PaymentCheckTokenClaimsBase & {
+  version: 1;
+};
+
+export type PaymentCheckTokenClaims = PaymentCheckTokenClaimsBase & {
+  version: 2;
+  paymentCheckId: string;
+};
+
+export type VerifiedPaymentCheckTokenClaims =
+  | LegacyPaymentCheckTokenClaims
+  | PaymentCheckTokenClaims;
+
 export type CreatePaymentCheckTokenInput = {
+  paymentCheckId: string;
   caseId: string;
   organizationId: string;
   action: PaymentCheckAction;
@@ -24,6 +37,7 @@ export type CreatePaymentCheckTokenInput = {
 
 export type VerifyPaymentCheckTokenOptions = {
   now?: number;
+  expectedPaymentCheckId?: string;
   expectedCaseId?: string;
   expectedAction?: PaymentCheckAction;
 };
@@ -34,11 +48,12 @@ export type PaymentCheckTokenVerifyFailure =
   | "WRONG_PURPOSE"
   | "BAD_SIGNATURE"
   | "EXPIRED"
+  | "PAYMENT_CHECK_MISMATCH"
   | "CASE_MISMATCH"
   | "ACTION_MISMATCH";
 
 export type PaymentCheckTokenVerifyResult =
-  | { ok: true; claims: PaymentCheckTokenClaims }
+  | { ok: true; claims: VerifiedPaymentCheckTokenClaims }
   | { ok: false; reason: PaymentCheckTokenVerifyFailure };
 
 function encodePayload(claims: PaymentCheckTokenClaims): string {
@@ -54,6 +69,7 @@ export function createPaymentCheckToken(input: CreatePaymentCheckTokenInput, sec
   const claims: PaymentCheckTokenClaims = {
     version: PAYMENT_CHECK_TOKEN_VERSION,
     purpose: PAYMENT_CHECK_TOKEN_PURPOSE,
+    paymentCheckId: input.paymentCheckId,
     caseId: input.caseId,
     organizationId: input.organizationId,
     action: input.action,
@@ -83,9 +99,11 @@ export function verifyPaymentCheckToken(
     return { ok: false, reason: "BAD_SIGNATURE" };
   }
 
-  let claims: PaymentCheckTokenClaims;
+  let claims: VerifiedPaymentCheckTokenClaims;
   try {
-    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as PaymentCheckTokenClaims;
+    claims = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8")
+    ) as VerifiedPaymentCheckTokenClaims;
   } catch {
     return { ok: false, reason: "MALFORMED" };
   }
@@ -94,7 +112,7 @@ export function verifyPaymentCheckToken(
     return { ok: false, reason: "MALFORMED" };
   }
 
-  if (claims.version !== PAYMENT_CHECK_TOKEN_VERSION) {
+  if (claims.version !== 1 && claims.version !== PAYMENT_CHECK_TOKEN_VERSION) {
     return { ok: false, reason: "UNSUPPORTED_VERSION" };
   }
 
@@ -105,6 +123,14 @@ export function verifyPaymentCheckToken(
   const now = options.now ?? Date.now();
   if (claims.expiresAt <= now) {
     return { ok: false, reason: "EXPIRED" };
+  }
+
+  if (
+    options.expectedPaymentCheckId !== undefined &&
+    (claims.version !== 2 ||
+      options.expectedPaymentCheckId !== claims.paymentCheckId)
+  ) {
+    return { ok: false, reason: "PAYMENT_CHECK_MISMATCH" };
   }
 
   if (options.expectedCaseId !== undefined && options.expectedCaseId !== claims.caseId) {
@@ -118,18 +144,26 @@ export function verifyPaymentCheckToken(
   return { ok: true, claims };
 }
 
-function isPlausibleClaims(value: unknown): value is PaymentCheckTokenClaims {
+function isPlausibleClaims(
+  value: unknown
+): value is VerifiedPaymentCheckTokenClaims {
   if (!value || typeof value !== "object") {
     return false;
   }
   const claims = value as Record<string, unknown>;
-  return (
+  const commonClaimsAreValid =
     typeof claims.version === "number" &&
     typeof claims.purpose === "string" &&
     typeof claims.caseId === "string" &&
     typeof claims.organizationId === "string" &&
     (claims.action === "PAID" || claims.action === "NOT_PAID") &&
-    typeof claims.expiresAt === "number"
+    typeof claims.expiresAt === "number";
+  if (!commonClaimsAreValid) {
+    return false;
+  }
+  return (
+    claims.version === 1 ||
+    (claims.version === 2 && typeof claims.paymentCheckId === "string")
   );
 }
 

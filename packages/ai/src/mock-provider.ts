@@ -59,6 +59,10 @@ export class MockAiProvider implements AiProvider {
     const lower = input.messageText.toLowerCase();
     const intent = lower.includes("paid") || lower.includes("uhraden")
       ? "PAID"
+      : lower.includes("súhlas") || lower.includes("accept")
+        ? "INSTALLMENT_ACCEPTED"
+        : lower.includes("nesúhlas") || lower.includes("reject")
+          ? "INSTALLMENT_REJECTED"
       : lower.includes("splát") || lower.includes("installment")
         ? "INSTALLMENT_REQUEST"
         : lower.includes("zaplat") || lower.includes("pay")
@@ -69,6 +73,8 @@ export class MockAiProvider implements AiProvider {
       intent,
       promisedPaymentDate: null,
       installmentRequested: intent === "INSTALLMENT_REQUEST",
+      explicitInstallmentAcceptance: intent === "INSTALLMENT_ACCEPTED",
+      mentionedPaymentAmount: null,
       summary: input.messageText.slice(0, 240),
       confidence: 0.72,
       warnings: ["MOCK_AI režim: klasifikácia je ukážková."]

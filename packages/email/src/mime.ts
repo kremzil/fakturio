@@ -20,6 +20,8 @@ export async function parseMimeEmail(
     messageId,
     inReplyTo: normalizeMessageId(parsed.inReplyTo),
     references: normalizeReferences(parsed.references),
+    autoSubmitted: headerValue(parsed.headers.get("auto-submitted")),
+    precedence: headerValue(parsed.headers.get("precedence")),
     from: firstAddress(parsed.from) ?? "",
     to: addresses(parsed.to),
     cc: addresses(parsed.cc),
@@ -35,9 +37,18 @@ export async function parseMimeEmail(
       messageId,
       inReplyTo: normalizeMessageId(parsed.inReplyTo),
       references: normalizeReferences(parsed.references),
+      autoSubmitted: headerValue(parsed.headers.get("auto-submitted")),
+      precedence: headerValue(parsed.headers.get("precedence")),
       date: parsed.date?.toISOString() ?? null
     }
   };
+}
+
+function headerValue(value: unknown): string | null {
+  if (typeof value === "string") {
+    return value.trim().toLowerCase() || null;
+  }
+  return null;
 }
 
 export function extractRawMimeInput(input: unknown): {
