@@ -162,6 +162,36 @@ describe("caseWorkflow durability", () => {
     });
   }, 60_000);
 
+  it("does not send a reminder when a pause command carries OVERDUE status", async () => {
+    const state = {
+      ...snapshot("OVERDUE", null),
+      automationPaused: true
+    };
+    const reminders: number[] = [];
+    const activities = createActivities({
+      snapshot: () => state,
+      onReminder: (level) => reminders.push(level)
+    });
+    const { worker, taskQueue } = await createWorker(testEnv, activities);
+
+    await worker.runUntil(async () => {
+      const handle = await testEnv.client.workflow.start("caseWorkflow", {
+        workflowId: `case-${randomUUID()}`,
+        taskQueue,
+        args: [{ caseId: "case-1", organizationId: "org-1" }]
+      });
+      await handle.signal(caseStateChangedSignal, {
+        commandId: "manual-pause",
+        type: WORKFLOW_COMMAND_TYPES.caseStateChanged,
+        payload: { status: "OVERDUE" }
+      });
+      await testEnv.sleep("1 hour");
+      expect(reminders).toEqual([]);
+      await handle.cancel();
+      await handle.result().catch(() => undefined);
+    });
+  }, 60_000);
+
   it("does not hot-loop when reminder 1 was already sent but status is still overdue", async () => {
     const state = snapshot("OVERDUE", null);
     const reminders: number[] = [];

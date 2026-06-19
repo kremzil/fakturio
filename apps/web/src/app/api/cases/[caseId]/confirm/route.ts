@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { CASE_EVENT_TYPES, validateInvoiceForWorkflow } from "@fakturio/shared";
-import { toDashboardCase } from "@/lib/case-data";
+import { dashboardCaseInclude, toDashboardCase } from "@/lib/case-data";
 import { getCaseForOrg, updateCaseForOrg } from "@/lib/case-access";
 import { httpErrorResponse, requireSession } from "@/lib/session";
 import { requestCaseWorkflowStart } from "@/lib/workflow-client";
@@ -16,6 +16,18 @@ export async function POST(_: Request, context: { params: Promise<{ caseId: stri
 
     if (!existing) {
       return NextResponse.json({ error: "Prípad neexistuje." }, { status: 404 });
+    }
+
+    if (
+      existing.confirmedAt ||
+      !["RECEIVED", "PARSED", "MANUAL_REVIEW_REQUIRED"].includes(
+        existing.status
+      )
+    ) {
+      return NextResponse.json(
+        { error: "Tento prípad už nemožno potvrdiť." },
+        { status: 409 }
+      );
     }
 
     const validation = validateInvoiceForWorkflow({
@@ -49,11 +61,7 @@ export async function POST(_: Request, context: { params: Promise<{ caseId: stri
           }
         }
       },
-      {
-        debtor: true,
-        invoiceDocuments: { orderBy: { createdAt: "desc" }, take: 1 },
-        events: { orderBy: { createdAt: "desc" }, take: 6 }
-      }
+      dashboardCaseInclude
     );
 
     if (!updated) {

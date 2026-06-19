@@ -22,8 +22,10 @@ Add SES/Mailpit provider paths, outbound payment-check/reminder communication, i
 
 Implemented: payment-check email, reminder 1 and reminder 2, signed Reply-To, raw MIME parsing, trusted SES ingress endpoint, attachment storage, invoice/reply idempotency, thread correlation, worker-side AI classification, promise/dispute policy and deterministic template replies.
 
-## Stage 6: Dashboard & Reporting
-Expand dashboard with case list filters, overdue queue, promises, communications and exportable case history.
+## Stage 6: Dashboard & Reporting - Operational dashboard baseline complete
+Implemented: organization-scoped case queue, status/search filters, attention and closed views, promise/installment/payment-check summaries, timeline, communications, responsive case detail, and audited manual paid/pause/resume/cancel actions.
+
+Remaining: case history export, dedicated dispute reporting and broader operational reporting.
 
 ## Stage 7: Advanced Automation - Installment baseline complete
 Implemented: standard three-payment plan, explicit acceptance, per-installment checks, broken-plan notices and `CALL_REQUIRED`. Remaining: voice-call adapter, post-reminder-2 escalation, legal package export, optional Textract and future bank integration.

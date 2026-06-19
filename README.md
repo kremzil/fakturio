@@ -41,7 +41,7 @@ npm run dev
 
 Репозиторий уже переведён на целевую структуру:
 
-- `apps/web` содержит первый рабочий dashboard и route handlers для upload/confirm/mark-paid.
+- `apps/web` содержит operational dashboard и route handlers для upload, review, confirm и ручного управления case.
 - `apps/worker` содержит Temporal worker, workflow starter и durable command dispatcher.
 - `packages/ai` содержит перенесённый OpenAI invoice parser.
 - `packages/db` содержит новую PostgreSQL Prisma schema.
@@ -106,6 +106,8 @@ source upload/email
 
 Доступ dashboard/API к case всегда ограничивается активной `Organization`. В production локальный Credentials provider и fallback на `local-user` отключены.
 
+Dashboard показывает общую очередь, состояния внимания, активные promises и installment plans, timeline, коммуникации и payment checks. Оператор может редактировать распознанную фактуру до подтверждения, отметить оплату, временно остановить/возобновить автоматизацию или окончательно закрыть case как отменённый. Каждое ручное действие создаёт audit event и durable `WorkflowCommand`.
+
 Пример локального email fixture:
 
 ```bash
@@ -118,7 +120,7 @@ curl -X POST http://localhost:3000/api/dev/email-inbound \
 
 ## Ближайший следующий этап
 
-- добавить dashboard-представления promises, disputes, payment checks и installment plans;
+- добавить экспорт полной истории case и отдельную очередь disputes;
 - выполнить полный Mailpit smoke с реальным web/worker процессом;
 - после юридической проверки добавить последующие escalation steps после reminder 2;
 - подключить voice adapter к событию `CALL_REQUIRED`.

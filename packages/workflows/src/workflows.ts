@@ -24,6 +24,8 @@ import {
 
 const COLLECTION_LOOP_PATCH = "case-collection-loop-v1";
 const OVERDUE_REMINDER_GUARD_PATCH = "overdue-reminder-loop-guard-v1";
+const STATE_CHANGE_SIDE_EFFECT_FREE_PATCH =
+  "state-change-side-effect-free-v1";
 const WORKFLOW_COMMAND_TYPES = {
   caseStateChanged: "CASE_STATE_CHANGED",
   debtorReplyReceived: "DEBTOR_REPLY_RECEIVED",
@@ -217,10 +219,15 @@ async function handleCommand(
 
   if (
     command.type === WORKFLOW_COMMAND_TYPES.caseStateChanged &&
-    command.payload.status === "OVERDUE"
+    command.payload.status === "OVERDUE" &&
+    !patched(STATE_CHANGE_SIDE_EFFECT_FREE_PATCH)
   ) {
     await sendReminder(input, 1);
   }
+
+  // State-change commands only wake the workflow. The loop reloads the authoritative
+  // snapshot before deciding whether a timer or side effect is allowed. The patch
+  // preserves replay compatibility for histories that already recorded the old branch.
   return "HANDLED";
 }
 

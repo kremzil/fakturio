@@ -144,6 +144,9 @@ export type CaseUpdateData = Pick<
   | "confirmedByUserId"
   | "confirmedAt"
   | "closedAt"
+  | "nextActionAt"
+  | "automationPausedAt"
+  | "automationPauseReason"
 > & {
   debtor?: { connect: { id: string } };
   events?: { create: CaseEventCreateData };

@@ -1,29 +1,36 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import {
-  CaseActionConflictError,
-  applyManualCaseAction
+  CaseActionConflictError
 } from "@/lib/case-actions";
+import { updateDebtorEmailForOrg } from "@/lib/case-contact";
 import { httpErrorResponse, requireSession } from "@/lib/session";
 
 export const runtime = "nodejs";
 
-export async function POST(_: Request, context: { params: Promise<{ caseId: string }> }) {
+const contactSchema = z.object({
+  debtorEmail: z.string().email()
+});
+
+export async function PATCH(
+  request: Request,
+  context: { params: Promise<{ caseId: string }> }
+) {
   try {
     const { caseId } = await context.params;
     const { organizationId, userId } = await requireSession();
-
-    const updated = await applyManualCaseAction({
+    const payload = contactSchema.parse(await request.json());
+    const result = await updateDebtorEmailForOrg({
       caseId,
       organizationId,
       userId,
-      action: "MARK_PAID"
+      email: payload.debtorEmail.trim().toLowerCase()
     });
 
-    if (!updated) {
+    if (!result) {
       return NextResponse.json({ error: "Prípad neexistuje." }, { status: 404 });
     }
-
-    return NextResponse.json({ case: updated });
+    return NextResponse.json({ case: result });
   } catch (error) {
     if (error instanceof CaseActionConflictError) {
       return NextResponse.json({ error: error.message }, { status: 409 });

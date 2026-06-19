@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { CASE_EVENT_TYPES, cleanText, parseIsoDate, validateInvoiceForWorkflow } from "@fakturio/shared";
 import { prisma } from "@fakturio/db";
-import { toDashboardCase } from "@/lib/case-data";
+import { dashboardCaseInclude, toDashboardCase } from "@/lib/case-data";
 import { getCaseForOrg, updateCaseForOrg } from "@/lib/case-access";
 import { httpErrorResponse, requireSession } from "@/lib/session";
 
@@ -20,6 +20,25 @@ const draftSchema = z.object({
   variableSymbol: z.string().nullable().optional()
 });
 
+export async function GET(
+  _: Request,
+  context: { params: Promise<{ caseId: string }> }
+) {
+  try {
+    const { caseId } = await context.params;
+    const { organizationId } = await requireSession();
+    const item = await getCaseForOrg(caseId, organizationId, dashboardCaseInclude);
+
+    if (!item) {
+      return NextResponse.json({ error: "Prípad neexistuje." }, { status: 404 });
+    }
+
+    return NextResponse.json({ case: toDashboardCase(item) });
+  } catch (error) {
+    return httpErrorResponse(error);
+  }
+}
+
 export async function PATCH(request: Request, context: { params: Promise<{ caseId: string }> }) {
   try {
     const { caseId } = await context.params;
@@ -30,6 +49,18 @@ export async function PATCH(request: Request, context: { params: Promise<{ caseI
 
     if (!existing) {
       return NextResponse.json({ error: "Prípad neexistuje." }, { status: 404 });
+    }
+
+    if (
+      existing.confirmedAt ||
+      !["RECEIVED", "PARSED", "MANUAL_REVIEW_REQUIRED"].includes(
+        existing.status
+      )
+    ) {
+      return NextResponse.json(
+        { error: "Údaje faktúry už nemožno meniť v tomto stave." },
+        { status: 409 }
+      );
     }
 
     const debtorName = cleanText(payload.debtorName);
@@ -94,11 +125,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ caseI
           }
         }
       },
-      {
-        debtor: true,
-        invoiceDocuments: { orderBy: { createdAt: "desc" }, take: 1 },
-        events: { orderBy: { createdAt: "desc" }, take: 6 }
-      }
+      dashboardCaseInclude
     );
 
     if (!updated) {

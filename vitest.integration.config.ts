@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { config as loadEnv } from "dotenv";
 import { defineConfig } from "vitest/config";
 
@@ -6,6 +7,11 @@ import { defineConfig } from "vitest/config";
 loadEnv();
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./apps/web/src", import.meta.url))
+    }
+  },
   test: {
     environment: "node",
     include: ["packages/**/*.integration.test.ts", "apps/**/*.integration.test.ts"],

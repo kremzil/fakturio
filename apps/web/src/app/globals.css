@@ -14,13 +14,10 @@
 
 body {
   margin: 0;
-  background:
-    linear-gradient(90deg, rgba(23, 32, 27, 0.035) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(23, 32, 27, 0.035) 1px, transparent 1px),
-    #f6f3ed;
-  background-size: 28px 28px;
+  background: #edf0ed;
   color: #17201b;
   font-family: var(--font-sans);
+  letter-spacing: 0;
 }
 
 button,
@@ -33,4 +30,45 @@ select {
 ::selection {
   background: #dff07b;
   color: #17201b;
+}
+
+button,
+label,
+input {
+  border-radius: 4px;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid #08736e;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
