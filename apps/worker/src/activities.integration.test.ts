@@ -8,8 +8,10 @@ const organizationId = `${RUN_ID}-org`;
 const debtorId = `${RUN_ID}-debtor`;
 const caseId = `${RUN_ID}-case`;
 const communicationId = `${RUN_ID}-communication`;
+const originalEmailDriver = process.env.EMAIL_DRIVER;
 
 beforeAll(async () => {
+  process.env.EMAIL_DRIVER = "fixture";
   await prisma.organization.create({
     data: {
       id: organizationId,
@@ -65,6 +67,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (originalEmailDriver === undefined) {
+    delete process.env.EMAIL_DRIVER;
+  } else {
+    process.env.EMAIL_DRIVER = originalEmailDriver;
+  }
   await prisma.organization.deleteMany({ where: { id: organizationId } });
   await prisma.$disconnect();
 });

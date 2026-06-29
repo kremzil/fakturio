@@ -1,4 +1,5 @@
 export * from "./counterparty-resolver";
+export * from "./customer-email-assistant";
 export * from "./email-routing";
 export * from "./debtor-reply";
 export * from "./inbound-email-processor";

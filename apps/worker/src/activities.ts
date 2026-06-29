@@ -323,57 +323,70 @@ export const activities: CaseWorkflowActivities = {
       notPaidUrl
     });
 
-    await sendTrackedEmail({
-      caseId: collectionCase.id,
-      idempotencyKey: `payment-check:${paymentCheck.id}`,
-      fromAddress: outboundFromAddress(),
-      toAddress: recipient,
-      template,
-      metadata: {
+    try {
+      await sendTrackedEmail({
         caseId: collectionCase.id,
-        organizationId: collectionCase.organizationId,
-        kind: "payment-check",
-        paymentCheckId: paymentCheck.id
-      },
-      rawPayload: {
-        kind: "payment-check",
-        paymentCheckId: paymentCheck.id,
-        reason: paymentCheck.reason,
-        paidUrl,
-        notPaidUrl
-      },
-      onConfirmed: async (tx, communicationId, provider) => {
-        await tx.paymentCheck.updateMany({
-          where: {
-            id: paymentCheck.id,
-            caseId: collectionCase.id,
-            status: { in: ["PENDING", "SENT"] }
-          },
-          data: { status: "SENT", communicationId }
-        });
-        await tx.case.updateMany({
-          where: {
-            id: collectionCase.id,
-            organizationId: collectionCase.organizationId
-          },
-          data: { nextActionAt: null }
-        });
-        await tx.caseEvent.create({
-          data: {
-            caseId: collectionCase.id,
-            actorType: "WORKFLOW",
-            type: CASE_EVENT_TYPES.paymentCheckSent,
-            note: `Payment check ${paymentCheck.sequence} sent to ${recipient}.`,
-            payload: {
-              paymentCheckId: paymentCheck.id,
-              reason: paymentCheck.reason,
-              communicationId,
-              provider
+        idempotencyKey: `payment-check:${paymentCheck.id}`,
+        fromAddress: outboundFromAddress(),
+        toAddress: recipient,
+        template,
+        metadata: {
+          caseId: collectionCase.id,
+          organizationId: collectionCase.organizationId,
+          kind: "payment-check",
+          paymentCheckId: paymentCheck.id
+        },
+        rawPayload: {
+          kind: "payment-check",
+          paymentCheckId: paymentCheck.id,
+          reason: paymentCheck.reason,
+          paidUrl,
+          notPaidUrl
+        },
+        onConfirmed: async (tx, communicationId, provider) => {
+          await tx.paymentCheck.updateMany({
+            where: {
+              id: paymentCheck.id,
+              caseId: collectionCase.id,
+              status: { in: ["PENDING", "SENT"] }
+            },
+            data: { status: "SENT", communicationId }
+          });
+          await tx.case.updateMany({
+            where: {
+              id: collectionCase.id,
+              organizationId: collectionCase.organizationId
+            },
+            data: { nextActionAt: null }
+          });
+          await tx.caseEvent.create({
+            data: {
+              caseId: collectionCase.id,
+              actorType: "WORKFLOW",
+              type: CASE_EVENT_TYPES.paymentCheckSent,
+              note: `Payment check ${paymentCheck.sequence} sent to ${recipient}.`,
+              payload: {
+                paymentCheckId: paymentCheck.id,
+                reason: paymentCheck.reason,
+                communicationId,
+                provider
+              }
             }
-          }
-        });
+          });
+        }
+      });
+    } catch (error) {
+      if (!isPermanentEmailRejection(error)) {
+        throw error;
       }
-    });
+      await pauseForMissingContact(
+        collectionCase.id,
+        collectionCase.organizationId,
+        "CUSTOMER_EMAIL_REJECTED",
+        `Payment check was not sent because the customer email provider rejected ${recipient}.`
+      );
+      return null;
+    }
 
     return { paymentCheckId: paymentCheck.id };
   },
@@ -1469,6 +1482,27 @@ async function markCommunicationSendFailed(
       }
     })
     .catch(() => undefined);
+}
+
+function isPermanentEmailRejection(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const record = error as { name?: unknown; message?: unknown; Code?: unknown; code?: unknown };
+  const code =
+    typeof record.name === "string"
+      ? record.name
+      : typeof record.Code === "string"
+        ? record.Code
+        : typeof record.code === "string"
+          ? record.code
+          : "";
+  const message = typeof record.message === "string" ? record.message : "";
+  return (
+    code === "MessageRejected" ||
+    (code === "BadRequestException" &&
+      /not verified|identity|recipient|address/i.test(message))
+  );
 }
 
 async function loadCaseForCollection(caseId: string, organizationId: string) {

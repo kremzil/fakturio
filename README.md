@@ -104,6 +104,8 @@ source upload/email
 
 Если повторный контроль после reminder 1 подтверждает отсутствие оплаты, workflow немедленно отправляет reminder 2. Его словацкий юридический текст должен пройти отдельную проверку перед production.
 
+Если email-фактура распарсилась не полностью и case требует ручной проверки, intake отправляет заказчику уточняющее письмо. `Reply-To` использует подписанный адрес вида `clarify+...@fakturio.shark.sk`, поэтому ответ клиента привязывается к конкретному case до debtor-reply и invoice-intake логики. Customer email assistant понимает свободный текст через Structured Outputs, дополняет только отсутствующие данные фактуры, сохраняет комментарии заказчика в timeline и может ответить текущим статусом case. Если заказчик просит прислать данные на контроль, ответ со сводкой содержит signed link `Potvrdiť a spustiť kontrolu`: `GET` только показывает страницу подтверждения, а явный `POST` переводит case в `WAITING_FOR_DUE_DATE` и запрашивает старт workflow. Запросы вроде остановки, закрытия или подтверждения оплаты из письма не выполняются автоматически.
+
 Если case не найден, письмо маршрутизируется по `EmailIntakeAddress` и проходит обычный invoice intake. Production-модель: каждому заказчику выдаётся уникальный intake alias вида `abc-sro@fakturio.shark.sk`; общий `collection@fakturio.shark.sk` используется только как исходящий sender и не должен принимать новые фактуры. Отправитель (`From`) может использоваться как дополнительная allowlist-проверка, но не как основной способ определения клиента. Повторная доставка одного SES сообщения не создаёт второй case. Для SES/S3 режима worker читает `SES_INBOUND_BUCKET`/`SES_INBOUND_PREFIX`, парсит raw MIME, после успешной обработки перемещает объект в `SES_INBOUND_PROCESSED_PREFIX`, а непонятные или не смаршрутизированные письма - в `SES_INBOUND_FAILED_PREFIX`. Poller включается при `EMAIL_DRIVER=ses` или `SES_INBOUND_POLLING=1`.
 
 Для текущего SES test-domain:
@@ -120,6 +122,8 @@ SES_INBOUND_PROCESSED_PREFIX=processed/
 SES_INBOUND_FAILED_PREFIX=failed/
 INBOUND_REPLY_DOMAIN=fakturio.shark.sk
 INBOUND_INTAKE_ADDRESSES=invoices@fakturio.shark.sk
+# В SES sandbox это должен быть verified recipient, иначе payment-check письма будут отклонены.
+LOCAL_USER_EMAIL=kremzil@gmail.com
 ```
 
 Доступ dashboard/API к case всегда ограничивается активной `Organization`. В production локальный Credentials provider и fallback на `local-user` отключены.

@@ -75,7 +75,7 @@ export async function dispatchPendingWorkflowCommands(
         args: [workflowInput],
         signal: caseCommandSignal,
         signalArgs: [command],
-        workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
+        workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
         workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING
       });
       if (command.type === WORKFLOW_COMMAND_TYPES.caseStateChanged) {

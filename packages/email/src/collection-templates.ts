@@ -204,6 +204,197 @@ export function buildCustomerExceptionNotice(input: {
   );
 }
 
+export function buildCustomerInvoiceClarificationRequest(input: {
+  invoiceNumber: string | null;
+  missingFields: string[];
+  warnings: string[];
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "novej faktúre";
+  const missing =
+    input.missingFields.length > 0
+      ? input.missingFields
+      : ["údaje označené v aplikácii ako nejasné"];
+  const warningLines =
+    input.warnings.length > 0
+      ? ["", "Poznámky z automatického spracovania:", ...input.warnings.map((item) => `- ${item}`)]
+      : [];
+
+  return template(
+    `FAKTURIO: potrebujeme doplniť údaje k ${reference}`,
+    [
+      "Dobrý deň,",
+      "",
+      `pri spracovaní ${reference} sa nepodarilo spoľahlivo načítať všetky údaje potrebné na založenie prípadu.`,
+      "",
+      "Prosíme, odpovedzte na tento email a doplňte:",
+      ...missing.map((field) => `- ${field}`),
+      ...warningLines,
+      "",
+      "Nižšie je iba ukážka formátu odpovede. Nie sú to údaje z Vašej faktúry:",
+      "--- PRÍKLAD FORMÁTU ---",
+      "Číslo faktúry: napr. FV-2026-001",
+      "Dátum splatnosti: napr. 2026-07-15",
+      "Suma: napr. 480,00",
+      "Mena: napr. EUR",
+      "Odberateľ: napr. Názov dlžníka s.r.o.",
+      "IBAN: napr. SK...",
+      "Variabilný symbol: napr. 2026001",
+      "--- KONIEC PRÍKLADU ---",
+      "",
+      "Ďakujeme."
+    ]
+  );
+}
+
+export function buildCustomerAssistantAcknowledgement(input: {
+  invoiceNumber: string | null;
+  summary: string;
+  stillMissing: string[];
+  confirmUrl?: string | null;
+  dashboardUrl?: string | null;
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "prípadu";
+  const missing =
+    input.stillMissing.length > 0
+      ? ["", "Stále potrebujeme doplniť:", ...input.stillMissing.map((field) => `- ${field}`)]
+      : ["", "Aktualizované údaje sú pripravené na kontrolu v aplikácii."];
+
+  return template(
+    `FAKTURIO: odpoveď k ${reference} sme spracovali`,
+    [
+      "Dobrý deň,",
+      "",
+      "ďakujeme za odpoveď. Informácie sme zaevidovali k prípadu.",
+      input.summary,
+      ...missing,
+      input.confirmUrl
+        ? `Ak sú údaje správne, potvrďte spustenie kontroly tu: ${input.confirmUrl}`
+        : "",
+      input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
+  );
+}
+
+export function buildCustomerMissingFieldsFollowUp(input: {
+  invoiceNumber: string | null;
+  stillMissing: string[];
+  dashboardUrl?: string | null;
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "faktúre";
+  return template(
+    `FAKTURIO: potrebujeme ešte doplniť údaje k ${reference}`,
+    [
+      "Dobrý deň,",
+      "",
+      "ďakujeme za odpoveď. Na dokončenie spracovania ešte potrebujeme tieto údaje:",
+      ...input.stillMissing.map((field) => `- ${field}`),
+      "",
+      "Prosíme, odpovedzte priamo na tento email.",
+      input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
+  );
+}
+
+export function buildCustomerAmbiguousCaseFollowUp(input: {
+  matchedAddress: string | null;
+}): CollectionTemplate {
+  return template(
+    "FAKTURIO: potrebujeme identifikovať prípad",
+    [
+      "Dobrý deň,",
+      "",
+      "vašu správu sme prijali, ale nevieme ju jednoznačne priradiť ku konkrétnej faktúre.",
+      "Prosíme, pošlite číslo faktúry alebo názov dlžníka, ktorého sa správa týka.",
+      input.matchedAddress ? `Doručené na adresu: ${input.matchedAddress}` : "",
+      "",
+      "Ďakujeme."
+    ].filter(Boolean)
+  );
+}
+
+export function buildCustomerActionNeedsConfirmation(input: {
+  invoiceNumber: string | null;
+  requestedAction: string;
+  dashboardUrl?: string | null;
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "prípadu";
+  return template(
+    `FAKTURIO: akcia k ${reference} vyžaduje potvrdenie`,
+    [
+      "Dobrý deň,",
+      "",
+      "vašu požiadavku sme zaevidovali:",
+      input.requestedAction,
+      "",
+      "Z bezpečnostných dôvodov ju automaticky nevykonáme z emailu.",
+      "Prosíme, potvrďte akciu v dashboarde FAKTURIO.",
+      input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
+  );
+}
+
+export function buildCustomerManualReviewEscalation(input: {
+  invoiceNumber: string | null;
+  summary: string;
+  dashboardUrl?: string | null;
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "prípadu";
+  return template(
+    `FAKTURIO: správa k ${reference} vyžaduje kontrolu`,
+    [
+      "Dobrý deň,",
+      "",
+      "vašu správu sme zaevidovali, ale automaticky ju nespracujeme.",
+      input.summary,
+      "Prípad zostáva na manuálnej kontrole v aplikácii.",
+      input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
+  );
+}
+
+export function buildCustomerCaseStatusReply(input: {
+  invoiceNumber: string | null;
+  status: string;
+  amountTotal: number | null;
+  currency: string | null;
+  dueDate: string | null;
+  debtorName: string | null;
+  confirmUrl?: string | null;
+  dashboardUrl?: string | null;
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "prípadu";
+  const amount =
+    input.amountTotal !== null
+      ? `${input.amountTotal.toFixed(2)} ${input.currency || ""}`.trim()
+      : "nezadaná";
+  return template(
+    `FAKTURIO: stav ${reference}`,
+    [
+      "Dobrý deň,",
+      "",
+      `Aktuálny stav: ${input.status}`,
+      `Faktúra: ${input.invoiceNumber || "nezadaná"}`,
+      `Dlžník: ${input.debtorName || "nezadaný"}`,
+      `Suma: ${amount}`,
+      `Splatnosť: ${input.dueDate || "nezadaná"}`,
+      input.confirmUrl
+        ? `Ak sú údaje správne, potvrďte spustenie kontroly tu: ${input.confirmUrl}`
+        : "",
+      input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
+  );
+}
+
 function template(subject: string, lines: string[]): CollectionTemplate {
   const textBody = lines.join("\n");
   const htmlBody = lines

@@ -1,5 +1,5 @@
 import type { AiProvider } from "@fakturio/shared";
-import type { InboundEmail } from "@fakturio/email";
+import type { EmailProvider, InboundEmail } from "@fakturio/email";
 import type { StorageProvider } from "@fakturio/storage";
 
 export type IntakeActor = {
@@ -32,4 +32,5 @@ export type IntakeCaseResult = {
 export type InvoiceIntakeDependencies = {
   ai: AiProvider;
   storage: StorageProvider;
+  email: EmailProvider;
 };

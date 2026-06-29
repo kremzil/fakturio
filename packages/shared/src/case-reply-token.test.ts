@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  createCaseClarificationAddress,
   createCaseReplyAddress,
+  verifyCaseClarificationAddress,
   verifyCaseReplyAddress
 } from "./case-reply-token";
 
@@ -28,5 +30,18 @@ describe("signed case reply addresses", () => {
     expect(
       verifyCaseReplyAddress(address.replace("case-1", "case-2"), SECRET)
     ).toBeNull();
+  });
+
+  it("round-trips a customer clarification address without accepting it as debtor reply", () => {
+    const address = createCaseClarificationAddress(
+      { caseId: "case-1", domain: "fakturio.example" },
+      SECRET
+    );
+
+    expect(address).toMatch(/^clarify\+case-1\./);
+    expect(verifyCaseClarificationAddress(address, SECRET)).toEqual({
+      caseId: "case-1"
+    });
+    expect(verifyCaseReplyAddress(address, SECRET)).toBeNull();
   });
 });

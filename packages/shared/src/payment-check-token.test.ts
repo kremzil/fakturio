@@ -1,10 +1,12 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  createCaseConfirmToken,
   createPaymentCheckToken,
   resolvePaymentCheckTransition,
+  verifyCaseConfirmToken,
   verifyPaymentCheckToken
-} from "./payment-check-token";
+} from "./index";
 
 const SECRET = "test-secret-at-least-16-chars";
 const FUTURE = Date.now() + 60_000;
@@ -114,6 +116,47 @@ describe("payment-check token", () => {
 
   it("requires a sufficiently long secret", () => {
     expect(() => createPaymentCheckToken({ paymentCheckId: "pc", caseId: "c", organizationId: "o", action: "PAID", expiresAt: FUTURE }, "short")).toThrow();
+  });
+});
+
+describe("case-confirm token", () => {
+  it("creates and verifies a case confirmation token", () => {
+    const token = createCaseConfirmToken(
+      {
+        caseId: "case-1",
+        organizationId: "org-1",
+        expiresAt: FUTURE
+      },
+      SECRET
+    );
+
+    expect(verifyCaseConfirmToken(token, SECRET, { expectedCaseId: "case-1" })).toEqual({
+      ok: true,
+      claims: {
+        version: 1,
+        purpose: "case-confirm",
+        caseId: "case-1",
+        organizationId: "org-1",
+        action: "CONFIRM_AND_START",
+        expiresAt: FUTURE
+      }
+    });
+  });
+
+  it("rejects a case confirmation token for another case", () => {
+    const token = createCaseConfirmToken(
+      {
+        caseId: "case-1",
+        organizationId: "org-1",
+        expiresAt: FUTURE
+      },
+      SECRET
+    );
+
+    expect(verifyCaseConfirmToken(token, SECRET, { expectedCaseId: "case-2" })).toEqual({
+      ok: false,
+      reason: "CASE_MISMATCH"
+    });
   });
 });
 

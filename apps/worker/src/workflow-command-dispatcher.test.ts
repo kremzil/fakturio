@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowIdConflictPolicy,
+  WorkflowIdReusePolicy
+} from "@temporalio/client";
 
 const findMany = vi.fn();
 const updateManyAndReturn = vi.fn();
@@ -69,6 +73,8 @@ describe("workflow command dispatcher", () => {
       expect.objectContaining({
         workflowId: "case-case-1",
         taskQueue: "test-queue",
+        workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+        workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING,
         signalArgs: [
           {
             commandId: "cmd-1",

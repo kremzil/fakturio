@@ -29,6 +29,21 @@ export async function POST(request: Request) {
   });
 
   const result = await processInboundEmail(email);
+  if (result.kind === "CUSTOMER_ASSISTANT") {
+    return NextResponse.json(
+      {
+        kind: "CUSTOMER_ASSISTANT",
+        caseId: result.assistant.caseId,
+        duplicate: result.assistant.duplicate,
+        appliedFields: result.assistant.appliedFields,
+        stillMissing: result.assistant.stillMissing,
+        intent: result.assistant.intent,
+        replySent: result.assistant.replySent
+      },
+      { status: 202 }
+    );
+  }
+
   if (result.kind === "DEBTOR_REPLY") {
     return NextResponse.json(
       {

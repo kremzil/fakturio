@@ -19,7 +19,10 @@ const developmentProviders =
             email: { label: "Email", type: "email" }
           },
           async authorize(credentials) {
-            const email = typeof credentials?.email === "string" ? credentials.email : "local-user@fakturio.test";
+            const email =
+              typeof credentials?.email === "string"
+                ? credentials.email
+                : process.env.LOCAL_USER_EMAIL || "local-user@fakturio.test";
 
             return {
               id: "local-user",

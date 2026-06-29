@@ -2,12 +2,20 @@ import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { createAiProvider } from "@fakturio/ai";
 import { prisma } from "@fakturio/db";
-import type { InboundEmail, InboundEmailAttachment } from "@fakturio/email";
+import {
+  buildCustomerInvoiceClarificationRequest,
+  createEmailProvider,
+  type InboundEmail,
+  type InboundEmailAttachment
+} from "@fakturio/email";
 import {
   CASE_EVENT_TYPES,
+  cleanText,
+  createCaseClarificationAddress,
   MAX_INVOICE_UPLOAD_BYTES,
   isAcceptedInvoiceMimeType,
   parseIsoDate,
+  requireInboundReplyTokenSecret,
   validateInvoiceForWorkflow
 } from "@fakturio/shared";
 import { createStorageProvider } from "@fakturio/storage";
@@ -32,7 +40,8 @@ export class InvoiceIntakeService {
   constructor(deps: Partial<InvoiceIntakeDependencies> = {}) {
     this.deps = {
       ai: deps.ai ?? createAiProvider(),
-      storage: deps.storage ?? createStorageProvider()
+      storage: deps.storage ?? createStorageProvider(),
+      email: deps.email ?? createEmailProvider()
     };
   }
 
@@ -235,6 +244,17 @@ export class InvoiceIntakeService {
         }
       });
 
+      if (input.sourceType === "EMAIL" && input.email && status === "MANUAL_REVIEW_REQUIRED") {
+        await this.sendCustomerClarificationRequest({
+          caseId: collectionCase.id,
+          customerEmail: input.email.from,
+          invoiceNumber: parsed.invoiceNumber,
+          missingFields: validation.errors,
+          warnings,
+          idempotencyKey: `customer-clarification-request:${input.email.provider}:${input.email.providerId}:${collectionCase.id}`
+        });
+      }
+
       return { caseId: collectionCase.id, status, parseError: null };
     } catch (error) {
       await prisma.case.update({
@@ -251,6 +271,17 @@ export class InvoiceIntakeService {
           }
         }
       });
+
+      if (input.sourceType === "EMAIL" && input.email) {
+        await this.sendCustomerClarificationRequest({
+          caseId: collectionCase.id,
+          customerEmail: input.email.from,
+          invoiceNumber: null,
+          missingFields: ["údaje potrebné na spracovanie faktúry"],
+          warnings: ["Automatické načítanie zlyhalo. Doplňte údaje manuálne."],
+          idempotencyKey: `customer-clarification-request:${input.email.provider}:${input.email.providerId}:${collectionCase.id}`
+        });
+      }
 
       return {
         caseId: collectionCase.id,
@@ -310,6 +341,100 @@ export class InvoiceIntakeService {
       status: "MANUAL_REVIEW_REQUIRED",
       parseError: "No supported invoice attachment found."
     };
+  }
+
+  private async sendCustomerClarificationRequest(input: {
+    caseId: string;
+    customerEmail: string | null;
+    invoiceNumber: string | null;
+    missingFields: string[];
+    warnings: string[];
+    idempotencyKey: string;
+  }): Promise<void> {
+    const to = cleanText(input.customerEmail);
+    if (!to) {
+      return;
+    }
+
+    const existing = await prisma.communication.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+      select: { id: true, status: true }
+    });
+    if (existing?.status === "SENT") {
+      return;
+    }
+
+    const template = buildCustomerInvoiceClarificationRequest({
+      invoiceNumber: input.invoiceNumber,
+      missingFields: input.missingFields,
+      warnings: input.warnings
+    });
+    const replyTo = createCaseClarificationAddress(
+      { caseId: input.caseId, domain: inboundReplyDomain() },
+      requireInboundReplyTokenSecret()
+    );
+    const from = process.env.SES_FROM_EMAIL || "system@example.com";
+
+    const communication =
+      existing ??
+      (await prisma.communication.create({
+        data: {
+          caseId: input.caseId,
+          direction: "OUTBOUND",
+          channel: "EMAIL",
+          status: "DRAFT",
+          idempotencyKey: input.idempotencyKey,
+          fromAddress: from,
+          toAddress: to,
+          subject: template.subject,
+          textBody: template.textBody,
+          htmlBody: template.htmlBody,
+          rawPayload: {
+            kind: "customer-invoice-clarification-request",
+            replyTo,
+            missingFields: input.missingFields
+          }
+        },
+        select: { id: true, status: true }
+      }));
+
+    const sent = await this.deps.email.sendEmail({
+      from,
+      to: [to],
+      replyTo: [replyTo],
+      subject: template.subject,
+      textBody: template.textBody,
+      htmlBody: template.htmlBody,
+      metadata: {
+        caseId: input.caseId,
+        kind: "customer-clarification"
+      }
+    });
+
+    await prisma.$transaction([
+      prisma.communication.update({
+        where: { id: communication.id },
+        data: {
+          status: "SENT",
+          provider: sent.provider,
+          providerId: sent.providerId,
+          messageId: normalizeMessageId(sent.providerId),
+          sentAt: new Date()
+        }
+      }),
+      prisma.caseEvent.create({
+        data: {
+          caseId: input.caseId,
+          actorType: "SYSTEM",
+          type: CASE_EVENT_TYPES.emailSent,
+          note: `Customer clarification request sent to ${to}.`,
+          payload: {
+            communicationId: communication.id,
+            missingFields: input.missingFields
+          }
+        }
+      })
+    ]);
   }
 }
 
@@ -414,6 +539,17 @@ function inboundInvoiceIdempotencyKey(
 function normalizeMessageId(value: string | null | undefined): string | null {
   const normalized = value?.trim().replace(/^<|>$/g, "").toLowerCase();
   return normalized || null;
+}
+
+function inboundReplyDomain(): string {
+  const domain = process.env.INBOUND_REPLY_DOMAIN;
+  if (domain?.trim()) {
+    return domain.trim().toLowerCase();
+  }
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("INBOUND_REPLY_DOMAIN is required in production.");
+  }
+  return "reply.fakturio.local";
 }
 
 function isUniqueConstraintViolation(error: unknown): boolean {

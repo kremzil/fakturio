@@ -26,6 +26,8 @@ const COLLECTION_LOOP_PATCH = "case-collection-loop-v1";
 const OVERDUE_REMINDER_GUARD_PATCH = "overdue-reminder-loop-guard-v1";
 const STATE_CHANGE_SIDE_EFFECT_FREE_PATCH =
   "state-change-side-effect-free-v1";
+const RETRY_PAYMENT_CHECK_AFTER_PAUSE_PATCH =
+  "retry-payment-check-after-pause-v1";
 const WORKFLOW_COMMAND_TYPES = {
   caseStateChanged: "CASE_STATE_CHANGED",
   debtorReplyReceived: "DEBTOR_REPLY_RECEIVED",
@@ -127,7 +129,9 @@ async function collectionCaseWorkflow(
           sourceKey: `due-date:${input.caseId}:${snapshot.dueDate}`,
           reason: "DUE_DATE"
         });
-        dueDateCheckHandled = true;
+        if (sent || !patched(RETRY_PAYMENT_CHECK_AFTER_PAUSE_PATCH)) {
+          dueDateCheckHandled = true;
+        }
         await activities.recordWorkflowEvent({
           ...input,
           type: "WORKFLOW_WAITING",

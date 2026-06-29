@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
-import { CASE_EVENT_TYPES, validateInvoiceForWorkflow } from "@fakturio/shared";
 import { dashboardCaseInclude, toDashboardCase } from "@/lib/case-data";
-import { getCaseForOrg, updateCaseForOrg } from "@/lib/case-access";
+import { getCaseForOrg } from "@/lib/case-access";
 import { httpErrorResponse, requireSession } from "@/lib/session";
-import { requestCaseWorkflowStart } from "@/lib/workflow-client";
+import { confirmCaseForWorkflow } from "@/lib/case-confirm";
 
 export const runtime = "nodejs";
 
@@ -18,59 +17,29 @@ export async function POST(_: Request, context: { params: Promise<{ caseId: stri
       return NextResponse.json({ error: "Prípad neexistuje." }, { status: 404 });
     }
 
-    if (
-      existing.confirmedAt ||
-      !["RECEIVED", "PARSED", "MANUAL_REVIEW_REQUIRED"].includes(
-        existing.status
-      )
-    ) {
+    const result = await confirmCaseForWorkflow({
+      caseId,
+      organizationId,
+      actorType: "USER",
+      actorId: userId
+    });
+
+    if (result.outcome === "CONFLICT") {
       return NextResponse.json(
-        { error: "Tento prípad už nemožno potvrdiť." },
+        { error: result.message },
         { status: 409 }
       );
     }
-
-    const validation = validateInvoiceForWorkflow({
-      invoiceNumber: existing.invoiceNumber,
-      dueDate: existing.dueDate,
-      amountTotal: existing.amountTotal ? Number(existing.amountTotal) : null,
-      debtorName: existing.debtor?.name ?? null,
-      currency: existing.currency,
-      warnings: existing.warnings
-    });
-
-    if (validation.errors.length > 0) {
-      return NextResponse.json({ errors: validation.errors }, { status: 422 });
+    if (result.outcome === "VALIDATION_FAILED") {
+      return NextResponse.json({ errors: result.errors }, { status: 422 });
     }
-
-    const updated = await updateCaseForOrg(
-      caseId,
-      organizationId,
-      {
-        status: "WAITING_FOR_DUE_DATE",
-        currency: existing.currency ?? validation.currencyPatch,
-        warnings: validation.warningsPatch ?? existing.warnings,
-        confirmedByUserId: userId,
-        confirmedAt: new Date(),
-        events: {
-          create: {
-            actorType: "USER",
-            actorId: userId,
-            type: CASE_EVENT_TYPES.statusChanged,
-            note: "Case confirmed and ready for payment monitoring."
-          }
-        }
-      },
-      dashboardCaseInclude
-    );
-
-    if (!updated) {
+    if (result.outcome === "NOT_FOUND") {
       return NextResponse.json({ error: "Prípad neexistuje." }, { status: 404 });
     }
 
-    await requestCaseWorkflowStart({ caseId: updated.id, organizationId: updated.organizationId });
+    const updated = await getCaseForOrg(caseId, organizationId, dashboardCaseInclude);
 
-    return NextResponse.json({ case: toDashboardCase(updated) });
+    return NextResponse.json({ case: toDashboardCase(updated!) });
   } catch (error) {
     return httpErrorResponse(error);
   }

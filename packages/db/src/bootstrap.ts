@@ -4,6 +4,7 @@ export const LOCAL_ORG_ID = "local-org";
 export const LOCAL_USER_ID = "local-user";
 
 export async function ensureLocalBootstrap() {
+  const localUserEmail = configuredLocalUserEmail();
   const organization = await prisma.organization.upsert({
     where: { id: LOCAL_ORG_ID },
     update: {},
@@ -16,11 +17,13 @@ export async function ensureLocalBootstrap() {
 
   const user = await prisma.user.upsert({
     where: { id: LOCAL_USER_ID },
-    update: {},
+    update: {
+      email: localUserEmail
+    },
     create: {
       id: LOCAL_USER_ID,
       name: "Local User",
-      email: "local-user@fakturio.test"
+      email: localUserEmail
     }
   });
 
@@ -66,6 +69,12 @@ export async function ensureLocalBootstrap() {
   }
 
   return { organization, user };
+}
+
+function configuredLocalUserEmail(): string {
+  return (process.env.LOCAL_USER_EMAIL || "local-user@fakturio.test")
+    .trim()
+    .toLowerCase();
 }
 
 function configuredInboundIntakeAddresses(): string[] {

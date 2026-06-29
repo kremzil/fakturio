@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 const SIGNATURE_BYTES = 12;
 const REPLY_LOCAL_PREFIX = "reply+";
+const CLARIFICATION_LOCAL_PREFIX = "clarify+";
 
 export function createCaseReplyAddress(
   input: { caseId: string; domain: string },
@@ -26,6 +27,46 @@ export function verifyCaseReplyAddress(
   address: string,
   secret: string
 ): { caseId: string } | null {
+  return verifySignedCaseAddress(address, secret, {
+    prefix: REPLY_LOCAL_PREFIX,
+    purpose: "case-reply"
+  });
+}
+
+export function createCaseClarificationAddress(
+  input: { caseId: string; domain: string },
+  secret: string
+): string {
+  const caseId = normalizeCaseId(input.caseId);
+  const domain = input.domain.trim().toLowerCase();
+  if (!domain || domain.includes("@")) {
+    throw new Error("Reply email domain is invalid.");
+  }
+
+  const signature = signCaseId(caseId, secret, "case-clarification");
+  const localPart = `${CLARIFICATION_LOCAL_PREFIX}${caseId}.${signature}`;
+  if (localPart.length > 64) {
+    throw new Error("Case id is too long for a signed reply email address.");
+  }
+
+  return `${localPart}@${domain}`;
+}
+
+export function verifyCaseClarificationAddress(
+  address: string,
+  secret: string
+): { caseId: string } | null {
+  return verifySignedCaseAddress(address, secret, {
+    prefix: CLARIFICATION_LOCAL_PREFIX,
+    purpose: "case-clarification"
+  });
+}
+
+function verifySignedCaseAddress(
+  address: string,
+  secret: string,
+  options: { prefix: string; purpose: string }
+): { caseId: string } | null {
   const normalized = address.trim().toLowerCase();
   const at = normalized.lastIndexOf("@");
   if (at <= 0) {
@@ -33,11 +74,11 @@ export function verifyCaseReplyAddress(
   }
 
   const localPart = normalized.slice(0, at);
-  if (!localPart.startsWith(REPLY_LOCAL_PREFIX)) {
+  if (!localPart.startsWith(options.prefix)) {
     return null;
   }
 
-  const signedValue = localPart.slice(REPLY_LOCAL_PREFIX.length);
+  const signedValue = localPart.slice(options.prefix.length);
   const separator = signedValue.lastIndexOf(".");
   if (separator <= 0) {
     return null;
@@ -45,7 +86,7 @@ export function verifyCaseReplyAddress(
 
   const caseId = signedValue.slice(0, separator);
   const provided = signedValue.slice(separator + 1);
-  const expected = signCaseId(caseId, secret);
+  const expected = signCaseId(caseId, secret, options.purpose);
   const providedBytes = Buffer.from(provided);
   const expectedBytes = Buffer.from(expected);
 
@@ -72,12 +113,16 @@ export function requireInboundReplyTokenSecret(
   return "dev-insecure-inbound-reply-secret";
 }
 
-function signCaseId(caseId: string, secret: string): string {
+function signCaseId(
+  caseId: string,
+  secret: string,
+  purpose = "case-reply"
+): string {
   if (secret.length < 16) {
     throw new Error("Inbound reply token secret is too short.");
   }
   return createHmac("sha256", secret)
-    .update(`case-reply:v1:${caseId}`)
+    .update(`${purpose}:v1:${caseId}`)
     .digest()
     .subarray(0, SIGNATURE_BYTES)
     .toString("hex");

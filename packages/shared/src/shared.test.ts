@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { assertCaseTransition, canTransitionCase } from "./case-status";
+import { customerMessageClassificationSchema } from "./customer-message";
 import { invoiceExtractionResultSchema } from "./invoice";
 import { validateInvoiceForWorkflow } from "./validation";
 
@@ -44,5 +45,39 @@ describe("shared domain", () => {
     expect(() =>
       assertCaseTransition("OVERDUE", "READY_FOR_LEGAL_ACTION")
     ).toThrow(/Unsupported case transition/);
+  });
+
+  it("parses customer message classification schema", () => {
+    const parsed = customerMessageClassificationSchema.parse({
+      intent: "PROVIDE_INVOICE_FIELDS",
+      confidence: 0.91,
+      summary: "Customer clarified missing invoice fields.",
+      extractedInvoiceFields: {
+        invoiceNumber: "FV-1",
+        dueDate: "2026-07-15",
+        amountTotal: 480,
+        currency: "EUR",
+        debtorName: "Dlžník s.r.o.",
+        debtorEmail: null,
+        supplierName: null,
+        iban: null,
+        variableSymbol: null
+      },
+      debtorContactPatch: {
+        email: null,
+        name: null
+      },
+      caseReference: {
+        caseId: null,
+        invoiceNumber: "FV-1",
+        debtorName: null
+      },
+      customerNote: null,
+      requestedAction: null,
+      needsHumanReview: false,
+      replyDraft: null
+    });
+
+    expect(parsed.intent).toBe("PROVIDE_INVOICE_FIELDS");
   });
 });

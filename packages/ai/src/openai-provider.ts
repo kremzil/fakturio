@@ -3,9 +3,11 @@ import { zodTextFormat } from "openai/helpers/zod";
 import {
   AiProvider,
   CaseSummaryInput,
+  CustomerMessageInput,
   DebtorReplyInput,
   GenerateEmailInput,
   InvoiceExtractionInput,
+  customerMessageClassificationSchema,
   debtorReplyClassificationSchema,
   invoiceExtractionResultSchema
 } from "@fakturio/shared";
@@ -97,6 +99,46 @@ export class OpenAiProvider implements AiProvider {
     );
     if (!parsed) {
       throw new Error("OpenAI response did not contain debtor reply classification.");
+    }
+
+    return parsed;
+  }
+
+  async classifyCustomerMessage(input: CustomerMessageInput) {
+    const response = await this.client.responses.parse({
+      model: this.model,
+      store: false,
+      temperature: 0,
+      input: [
+        {
+          role: "system",
+          content:
+            "Classify messages from a FAKTURIO customer account user. The customer may clarify invoice fields, add a note, ask for case status, update missing debtor contact details, or request operational actions. Extract only explicit facts. Do not invent invoice values. Never perform or approve legal action, discounts, debt amount changes, payment confirmation, cancellation, pause, resume, or invoice confirmation. Mark destructive, financial, legal, contradictory, or low-certainty requests as needsHumanReview. Return structured classification only."
+        },
+        {
+          role: "user",
+          content: [
+            `Subject:\n${input.subject ?? "(none)"}`,
+            `Candidate cases:\n${JSON.stringify(input.candidateCases ?? [], null, 2)}`,
+            `Current case summary:\n${input.latestCaseSummary ?? "(none)"}`,
+            `Customer message:\n${input.messageText}`
+          ].join("\n\n")
+        }
+      ],
+      text: {
+        format: zodTextFormat(
+          customerMessageClassificationSchema,
+          "customer_message_classification"
+        )
+      }
+    });
+
+    const parsed = extractParsedResponse(
+      response,
+      customerMessageClassificationSchema.safeParse.bind(customerMessageClassificationSchema)
+    );
+    if (!parsed) {
+      throw new Error("OpenAI response did not contain customer message classification.");
     }
 
     return parsed;
