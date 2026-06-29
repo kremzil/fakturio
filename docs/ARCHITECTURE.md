@@ -34,7 +34,7 @@ Email intake stores inbound messages as `Communication` records. Each supported 
 
 ## Organization And Counterparty Matching
 
-`Organization` is the customer account in FAKTURIO. Inbound email routing is represented by `EmailIntakeAddress`, so addresses like `invoices@fakturio.local` or future customer aliases can point to the correct organization before parsing starts.
+`Organization` is the customer account in FAKTURIO. Inbound email routing is represented by `EmailIntakeAddress`, so addresses like `invoices@fakturio.local` or customer-specific aliases point to the correct organization before parsing starts. Production intake aliases must be unique per customer, for example `abc-sro@fakturio.shark.sk`. The shared sender address `collection@fakturio.shark.sk` is not an intake address for new invoices. Sender `From` checks may be used as an additional allowlist control, but customer identity is resolved from the recipient alias.
 
 Counterparties are scoped to an organization. `Debtor` is the debtor/customer's counterparty on the invoice. `Customer` currently stores the parsed supplier snapshot as a structured organization-scoped party; this may later collapse into an organization legal profile.
 

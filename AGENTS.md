@@ -35,6 +35,7 @@ Next.js runs at `http://localhost:3000`. Temporal UI runs at `http://localhost:8
 - Preserve auditability: every meaningful automated or user action should create a `CaseEvent`.
 - Scope every customer-facing case read and mutation to the active `Organization`; never authorize by globally unique `caseId` alone.
 - Keep invoice intake source-agnostic: upload and email paths should flow through `InvoiceIntakeService`.
+- Route new invoice emails by customer-specific `EmailIntakeAddress` aliases such as `abc-sro@fakturio.shark.sk`; never use the shared outbound `collection@...` address as a generic intake identity.
 - Match counterparties within an `Organization` before creating new `Debtor`/`Customer` records.
 - Use provider interfaces for OpenAI, S3, SES, and Temporal activities.
 - Keep Temporal workflow code deterministic; perform side effects only in activities.

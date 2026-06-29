@@ -104,7 +104,7 @@ source upload/email
 
 Если повторный контроль после reminder 1 подтверждает отсутствие оплаты, workflow немедленно отправляет reminder 2. Его словацкий юридический текст должен пройти отдельную проверку перед production.
 
-Если case не найден, письмо маршрутизируется по `EmailIntakeAddress` и проходит обычный invoice intake. Повторная доставка одного SES сообщения не создаёт второй case. Для SES/S3 режима worker читает `SES_INBOUND_BUCKET`/`SES_INBOUND_PREFIX`, парсит raw MIME, после успешной обработки перемещает объект в `SES_INBOUND_PROCESSED_PREFIX`, а непонятные или не смаршрутизированные письма - в `SES_INBOUND_FAILED_PREFIX`. Poller включается при `EMAIL_DRIVER=ses` или `SES_INBOUND_POLLING=1`.
+Если case не найден, письмо маршрутизируется по `EmailIntakeAddress` и проходит обычный invoice intake. Production-модель: каждому заказчику выдаётся уникальный intake alias вида `abc-sro@fakturio.shark.sk`; общий `collection@fakturio.shark.sk` используется только как исходящий sender и не должен принимать новые фактуры. Отправитель (`From`) может использоваться как дополнительная allowlist-проверка, но не как основной способ определения клиента. Повторная доставка одного SES сообщения не создаёт второй case. Для SES/S3 режима worker читает `SES_INBOUND_BUCKET`/`SES_INBOUND_PREFIX`, парсит raw MIME, после успешной обработки перемещает объект в `SES_INBOUND_PROCESSED_PREFIX`, а непонятные или не смаршрутизированные письма - в `SES_INBOUND_FAILED_PREFIX`. Poller включается при `EMAIL_DRIVER=ses` или `SES_INBOUND_POLLING=1`.
 
 Для текущего SES test-domain:
 
