@@ -2,11 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { SesEmailProvider } from "@fakturio/email";
-import {
-  DebtorReplyService,
-  InvoiceIntakeService,
-  resolveOrganizationForInboundEmail
-} from "@fakturio/intake";
+import { processInboundEmail } from "@fakturio/intake";
 
 export const runtime = "nodejs";
 
@@ -23,39 +19,39 @@ export async function POST(request: Request) {
 
   const payload = sesInboundSchema.parse(await request.json());
   const email = await new SesEmailProvider({
-    region: process.env.AWS_REGION || "eu-central-1"
+    region: process.env.AWS_REGION || "eu-central-1",
+    accessKeyId: process.env.SES_AWS_ACCESS_KEY_ID || undefined,
+    secretAccessKey: process.env.SES_AWS_SECRET_ACCESS_KEY || undefined
   }).parseInbound({
     ...payload,
     contentEncoding:
       payload.contentEncoding === "base64" ? "base64" : undefined
   });
 
-  const reply = await new DebtorReplyService().process(email);
-  if (reply) {
+  const result = await processInboundEmail(email);
+  if (result.kind === "DEBTOR_REPLY") {
     return NextResponse.json(
-      { kind: "DEBTOR_REPLY", caseId: reply.caseId, duplicate: reply.duplicate },
+      {
+        kind: "DEBTOR_REPLY",
+        caseId: result.reply.caseId,
+        duplicate: result.reply.duplicate
+      },
       { status: 202 }
     );
   }
 
-  const route = await resolveOrganizationForInboundEmail(email);
-  if (!route) {
+  if (result.kind === "UNMATCHED") {
     return NextResponse.json(
       { error: "No active organization email route matched the recipients." },
       { status: 422 }
     );
   }
 
-  const intake = await new InvoiceIntakeService().createFromEmail({
-    organizationId: route.organizationId,
-    email
-  });
-
   return NextResponse.json(
     {
       kind: "INVOICE_INTAKE",
-      caseIds: intake.cases.map((item) => item.caseId),
-      skippedAttachments: intake.skippedAttachments
+      caseIds: result.intake.cases.map((item) => item.caseId),
+      skippedAttachments: result.intake.skippedAttachments
     },
     { status: 202 }
   );

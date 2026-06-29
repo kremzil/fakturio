@@ -49,5 +49,28 @@ export async function ensureLocalBootstrap() {
     }
   });
 
+  for (const address of configuredInboundIntakeAddresses()) {
+    await prisma.emailIntakeAddress.upsert({
+      where: { address },
+      update: {
+        organizationId: organization.id,
+        active: true,
+        provider: "ses"
+      },
+      create: {
+        organizationId: organization.id,
+        address,
+        provider: "ses"
+      }
+    });
+  }
+
   return { organization, user };
+}
+
+function configuredInboundIntakeAddresses(): string[] {
+  return (process.env.INBOUND_INTAKE_ADDRESSES || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
 }

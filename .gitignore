@@ -18,5 +18,6 @@ coverage/
 tmp/
 dev-server.log
 .env
+*_accessKeys.csv
 packages/db/prisma/*.db
 packages/db/prisma/*.db-journal

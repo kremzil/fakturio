@@ -4,6 +4,8 @@ import { extractRawMimeInput, parseMimeEmail } from "./mime";
 
 export type SesEmailProviderOptions = {
   region: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
   client?: SESv2Client;
 };
 
@@ -11,7 +13,18 @@ export class SesEmailProvider implements EmailProvider {
   private readonly client: SESv2Client;
 
   constructor(options: SesEmailProviderOptions) {
-    this.client = options.client ?? new SESv2Client({ region: options.region });
+    this.client =
+      options.client ??
+      new SESv2Client({
+        region: options.region,
+        credentials:
+          options.accessKeyId && options.secretAccessKey
+            ? {
+                accessKeyId: options.accessKeyId,
+                secretAccessKey: options.secretAccessKey
+              }
+            : undefined
+      });
   }
 
   async sendEmail(input: SendEmailInput): Promise<SentEmailResult> {

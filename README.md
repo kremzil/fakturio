@@ -47,6 +47,7 @@ npm run dev
 - `packages/db` содержит новую PostgreSQL Prisma schema.
 - `packages/intake` содержит общий pipeline приёма фактур из upload и email.
 - `packages/storage` и `packages/email` фиксируют S3/SES target через provider abstraction.
+- Production inbound email может приниматься через SES receipt rule в S3; worker забирает raw MIME из bucket и запускает тот же intake pipeline.
 
 ## Текущий intake flow
 
@@ -54,6 +55,7 @@ npm run dev
 
 - UI upload: `POST /api/cases/upload`
 - локальный email fixture: `POST /api/dev/email-inbound`
+- production SES inbound: `SES -> S3 inbound/ -> apps/worker poller`
 
 Оба пути вызывают `InvoiceIntakeService`:
 
@@ -102,7 +104,23 @@ source upload/email
 
 Если повторный контроль после reminder 1 подтверждает отсутствие оплаты, workflow немедленно отправляет reminder 2. Его словацкий юридический текст должен пройти отдельную проверку перед production.
 
-Если case не найден, письмо маршрутизируется по `EmailIntakeAddress` и проходит обычный invoice intake. Повторная доставка одного SES сообщения не создаёт второй case.
+Если case не найден, письмо маршрутизируется по `EmailIntakeAddress` и проходит обычный invoice intake. Повторная доставка одного SES сообщения не создаёт второй case. Для SES/S3 режима worker читает `SES_INBOUND_BUCKET`/`SES_INBOUND_PREFIX`, парсит raw MIME, после успешной обработки перемещает объект в `SES_INBOUND_PROCESSED_PREFIX`, а непонятные или не смаршрутизированные письма - в `SES_INBOUND_FAILED_PREFIX`. Poller включается при `EMAIL_DRIVER=ses` или `SES_INBOUND_POLLING=1`.
+
+Для текущего SES test-domain:
+
+```env
+EMAIL_DRIVER=ses
+AWS_REGION=eu-central-1
+SES_FROM_EMAIL=collection@fakturio.shark.sk
+SES_AWS_ACCESS_KEY_ID=...
+SES_AWS_SECRET_ACCESS_KEY=...
+SES_INBOUND_BUCKET=fakturio-ses-inbound-728312363829-eu-central-1
+SES_INBOUND_PREFIX=inbound/
+SES_INBOUND_PROCESSED_PREFIX=processed/
+SES_INBOUND_FAILED_PREFIX=failed/
+INBOUND_REPLY_DOMAIN=fakturio.shark.sk
+INBOUND_INTAKE_ADDRESSES=invoices@fakturio.shark.sk
+```
 
 Доступ dashboard/API к case всегда ограничивается активной `Organization`. В production локальный Credentials provider и fallback на `local-user` отключены.
 
@@ -116,7 +134,7 @@ curl -X POST http://localhost:3000/api/dev/email-inbound \
   -d "{\"from\":\"sender@example.com\",\"subject\":\"Faktura\",\"attachments\":[{\"fileName\":\"invoice.pdf\",\"mimeType\":\"application/pdf\",\"base64\":\"...\"}]}"
 ```
 
-`/api/dev/email-inbound` отключён в production. Production SES receipt/Lambda adapter передаёт raw MIME на `POST /api/email/inbound/ses` с `Authorization: Bearer $INBOUND_EMAIL_WEBHOOK_SECRET`.
+`/api/dev/email-inbound` отключён в production. `POST /api/email/inbound/ses` остаётся совместимым вариантом для будущего trusted SES/Lambda adapter с `Authorization: Bearer $INBOUND_EMAIL_WEBHOOK_SECRET`, но текущий VPS-friendly путь - SES receipt rule, S3 bucket и worker poller.
 
 ## Ближайший следующий этап
 

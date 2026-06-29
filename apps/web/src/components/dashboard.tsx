@@ -32,6 +32,7 @@ import {
   Search,
   ShieldAlert,
   UploadCloud,
+  Users,
   X
 } from "lucide-react";
 import type {
@@ -39,6 +40,10 @@ import type {
   DashboardCommunication,
   DashboardEvent
 } from "@/lib/case-data";
+import type {
+  DashboardDebtor,
+  DashboardDebtorDetail
+} from "@/lib/debtor-data";
 
 const TERMINAL_STATUSES = new Set([
   "CLOSED_PAID",
@@ -106,7 +111,14 @@ type FilterId =
   | "COMMUNICATIONS"
   | "WORKFLOW"
   | "LEGAL";
-type NavView = "CASES" | "COMMUNICATIONS" | "WORKFLOW" | "LEGAL" | "ARCHIVE";
+type NavView =
+  | "CASES"
+  | "DEBTORS"
+  | "COMMUNICATIONS"
+  | "WORKFLOW"
+  | "LEGAL"
+  | "ARCHIVE";
+type DebtorFilterId = "ALL" | "ACTIVE" | "WITHOUT_EMAIL";
 type DetailTab = "OVERVIEW" | "TIMELINE" | "COMMUNICATIONS";
 type ReviewFormState = {
   invoiceNumber: string;
@@ -120,10 +132,25 @@ type ReviewFormState = {
   variableSymbol: string;
 };
 
-export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
+export function Dashboard({
+  initialCases,
+  initialDebtors
+}: {
+  initialCases: DashboardCase[];
+  initialDebtors: DashboardDebtor[];
+}) {
   const [cases, setCases] = useState(initialCases);
+  const [debtors, setDebtors] = useState(initialDebtors);
   const [selectedId, setSelectedId] = useState(initialCases[0]?.id ?? null);
+  const [selectedDebtorId, setSelectedDebtorId] = useState(
+    initialDebtors[0]?.id ?? null
+  );
+  const [debtorDetails, setDebtorDetails] = useState<
+    Record<string, DashboardDebtorDetail>
+  >({});
+  const [debtorLoadingId, setDebtorLoadingId] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterId>("ALL");
+  const [debtorFilter, setDebtorFilter] = useState<DebtorFilterId>("ALL");
   const [navView, setNavView] = useState<NavView>("CASES");
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -144,11 +171,21 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
     () => filterCases(cases, filter, deferredQuery),
     [cases, filter, deferredQuery]
   );
+  const filteredDebtors = useMemo(
+    () => filterDebtors(debtors, debtorFilter, deferredQuery),
+    [debtors, debtorFilter, deferredQuery]
+  );
   const selected = useMemo(
     () => cases.find((item) => item.id === selectedId) ?? cases[0] ?? null,
     [cases, selectedId]
   );
   const counts = useMemo(() => summarizeCases(cases), [cases]);
+  const debtorCounts = useMemo(() => summarizeDebtors(debtors), [debtors]);
+  const selectedDebtor = useMemo(
+    () =>
+      debtors.find((item) => item.id === selectedDebtorId) ?? debtors[0] ?? null,
+    [debtors, selectedDebtorId]
+  );
   const [reviewForm, setReviewForm] = useState<ReviewFormState>(() =>
     toReviewForm(initialCases[0] ?? null)
   );
@@ -171,6 +208,17 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
   }, [reviewDirty]);
+
+  useEffect(() => {
+    if (
+      navView === "DEBTORS" &&
+      selectedDebtor &&
+      !debtorDetails[selectedDebtor.id] &&
+      debtorLoadingId !== selectedDebtor.id
+    ) {
+      void loadDebtorDetail(selectedDebtor.id);
+    }
+  }, [navView, selectedDebtor, debtorDetails, debtorLoadingId]);
 
   async function uploadInvoice(formData: FormData) {
     const file = formData.get("file");
@@ -322,6 +370,77 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
     }
   }
 
+  async function loadDebtorDetail(debtorId: string) {
+    setDebtorLoadingId(debtorId);
+    try {
+      const response = await fetch(`/api/debtors/${debtorId}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        setMessage(payload.error ?? "Históriu dlžníka sa nepodarilo načítať.");
+        return;
+      }
+      setDebtorDetails((current) => ({
+        ...current,
+        [debtorId]: payload.debtor
+      }));
+    } finally {
+      setDebtorLoadingId((current) => (current === debtorId ? null : current));
+    }
+  }
+
+  async function refreshDebtors() {
+    try {
+      const response = await fetch("/api/debtors");
+      const payload = await response.json();
+      if (!response.ok) {
+        setMessage(payload.error ?? "Zoznam dlžníkov sa nepodarilo obnoviť.");
+        return;
+      }
+      const refreshed: DashboardDebtor[] = payload.debtors;
+      setDebtors(refreshed);
+      setDebtorDetails({});
+      setSelectedDebtorId((current) =>
+        current && refreshed.some((item) => item.id === current)
+          ? current
+          : refreshed[0]?.id ?? null
+      );
+    } catch {
+      setMessage("Zoznam dlžníkov sa nepodarilo obnoviť.");
+    }
+  }
+
+  function openDebtor(debtorId: string) {
+    if (!confirmDiscardedReview()) {
+      return;
+    }
+    setSelectedDebtorId(debtorId);
+    setMobileDetailOpen(true);
+  }
+
+  async function openCaseFromDebtor(item: DashboardCase) {
+    replaceCase(item);
+    setNavView("CASES");
+    setFilter("ALL");
+    setQuery("");
+    setSelectedId(item.id);
+    setMobileDetailOpen(true);
+    if (item.detailsLoaded) {
+      return;
+    }
+    setDetailLoadingId(item.id);
+    try {
+      const response = await fetch(`/api/cases/${item.id}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        setMessage(payload.error ?? "Detail prípadu sa nepodarilo načítať.");
+        return;
+      }
+      replaceCase(payload.case);
+    } finally {
+      setDetailLoadingId(null);
+    }
+  }
+
   function updateReviewField(field: keyof ReviewFormState, value: string) {
     setReviewForm((current) => ({ ...current, [field]: value }));
     setReviewDirty(true);
@@ -346,6 +465,10 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
     }
     setNavView(view);
     setMobileDetailOpen(false);
+    if (view === "DEBTORS") {
+      setDebtorFilter("ALL");
+      void refreshDebtors();
+    }
     setFilter(
       view === "COMMUNICATIONS"
         ? "COMMUNICATIONS"
@@ -388,6 +511,7 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
       <div className="min-h-screen xl:grid xl:grid-cols-[196px_430px_minmax(0,1fr)]">
         <Sidebar
           counts={counts}
+          debtorCount={debtors.length}
           activeView={navView}
           onNavigate={navigateDashboard}
         />
@@ -402,7 +526,9 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
               <div>
                 <h1 className="text-xl font-semibold">{navViewTitle(navView)}</h1>
                 <p className="mt-1 text-xs text-steel">
-                  {counts.open} otvorených · {counts.attention} vyžaduje zásah
+                  {navView === "DEBTORS"
+                    ? `${debtorCounts.active} ${debtorCounts.active === 1 ? "aktívny" : "aktívnych"} · ${debtorCounts.cases} ${slovakCaseLabel(debtorCounts.cases)} spolu`
+                    : `${counts.open} otvorených · ${counts.attention} vyžaduje zásah`}
                 </p>
               </div>
               <UploadInvoiceButton
@@ -418,12 +544,38 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
                 className="w-full border-0 bg-transparent p-0 text-sm outline-none ring-0 placeholder:text-steel/65 focus:ring-0"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="Hľadať faktúru alebo dlžníka"
+                placeholder={
+                  navView === "DEBTORS"
+                    ? "Hľadať dlžníka, email alebo IČO"
+                    : "Hľadať faktúru alebo dlžníka"
+                }
               />
             </label>
 
-            <div className="mt-3 grid grid-cols-3 gap-px overflow-hidden border border-zincLine bg-zincLine sm:grid-cols-6 xl:grid-cols-3 2xl:grid-cols-6">
-              {filterOptions(counts).map((option) => (
+            {navView === "DEBTORS" ? (
+              <div className="mt-3 grid grid-cols-3 gap-px overflow-hidden border border-zincLine bg-zincLine">
+                {debtorFilterOptions(debtorCounts).map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    aria-pressed={debtorFilter === option.id}
+                    onClick={() => setDebtorFilter(option.id)}
+                    className={`min-h-12 px-2 py-2 text-left transition ${
+                      debtorFilter === option.id
+                        ? "bg-[#14261f] text-white shadow-[inset_0_-3px_0_#42b8a8]"
+                        : "bg-white text-ink hover:bg-[#f1f2ed]"
+                    }`}
+                  >
+                    <span className="block text-[11px]">{option.label}</span>
+                    <span className="mt-0.5 block text-sm font-semibold">
+                      {option.count}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-3 grid grid-cols-3 gap-px overflow-hidden border border-zincLine bg-zincLine sm:grid-cols-6 xl:grid-cols-3 2xl:grid-cols-6">
+                {filterOptions(counts).map((option) => (
                 <button
                   key={option.id}
                   type="button"
@@ -443,8 +595,9 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
                     {option.count}
                   </span>
                 </button>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {message ? (
@@ -454,7 +607,16 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
           ) : null}
 
           <div className="max-h-[640px] overflow-y-auto xl:max-h-[calc(100vh-230px)]">
-            {filteredCases.length ? (
+            {navView === "DEBTORS" && filteredDebtors.length ? (
+              filteredDebtors.map((item) => (
+                <DebtorRow
+                  key={item.id}
+                  item={item}
+                  selected={selectedDebtor?.id === item.id}
+                  onSelect={() => openDebtor(item.id)}
+                />
+              ))
+            ) : navView !== "DEBTORS" && filteredCases.length ? (
               filteredCases.map((item) => (
                 <CaseRow
                   key={item.id}
@@ -466,7 +628,9 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
             ) : (
               <div className="px-6 py-16 text-center">
                 <Inbox className="mx-auto h-7 w-7 text-steel/55" />
-                <p className="mt-3 text-sm font-medium">Žiadne prípady</p>
+                <p className="mt-3 text-sm font-medium">
+                  {navView === "DEBTORS" ? "Žiadni dlžníci" : "Žiadne prípady"}
+                </p>
                 <p className="mt-1 text-xs text-steel">
                   Zmeňte filter alebo vyhľadávanie.
                 </p>
@@ -480,7 +644,21 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
             mobileDetailOpen ? "block" : "hidden"
           }`}
         >
-          {selected ? (
+          {navView === "DEBTORS" ? (
+            selectedDebtor ? (
+              <DebtorDetailPanel
+                item={selectedDebtor}
+                detail={debtorDetails[selectedDebtor.id] ?? null}
+                loading={debtorLoadingId === selectedDebtor.id}
+                onBack={closeMobileDetail}
+                onOpenCase={openCaseFromDebtor}
+              />
+            ) : (
+              <div className="flex min-h-[500px] items-center justify-center text-sm text-steel">
+                Zatiaľ nie sú evidovaní žiadni dlžníci.
+              </div>
+            )
+          ) : selected ? (
             <>
               <CaseHeader
                 item={selected}
@@ -541,10 +719,12 @@ export function Dashboard({ initialCases }: { initialCases: DashboardCase[] }) {
 
 function Sidebar({
   counts,
+  debtorCount,
   activeView,
   onNavigate
 }: {
   counts: ReturnType<typeof summarizeCases>;
+  debtorCount: number;
   activeView: NavView;
   onNavigate: (view: NavView) => void;
 }) {
@@ -656,6 +836,7 @@ function Sidebar({
             </div>
             <Navigation
               counts={counts}
+              debtorCount={debtorCount}
               activeView={activeView}
               onSelect={(view) => {
                 onNavigate(view);
@@ -673,6 +854,7 @@ function Sidebar({
         </div>
         <Navigation
           counts={counts}
+          debtorCount={debtorCount}
           activeView={activeView}
           onSelect={onNavigate}
         />
@@ -684,10 +866,12 @@ function Sidebar({
 
 function Navigation({
   counts,
+  debtorCount,
   activeView,
   onSelect
 }: {
   counts: ReturnType<typeof summarizeCases>;
+  debtorCount: number;
   activeView: NavView;
   onSelect: (view: NavView) => void;
 }) {
@@ -702,6 +886,13 @@ function Navigation({
         active={activeView === "CASES"}
         count={counts.open}
         onClick={() => onSelect("CASES")}
+      />
+      <NavItem
+        icon={Users}
+        label="Dlžníci"
+        active={activeView === "DEBTORS"}
+        count={debtorCount}
+        onClick={() => onSelect("DEBTORS")}
       />
       <NavItem
         icon={Mail}
@@ -821,6 +1012,198 @@ function UploadInvoiceButton({
         disabled={isUploading}
       />
     </form>
+  );
+}
+
+function DebtorRow({
+  item,
+  selected,
+  onSelect
+}: {
+  item: DashboardDebtor;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`relative w-full border-b border-zincLine px-5 py-4 text-left transition ${
+        selected ? "bg-white" : "bg-[#f8f8f5] hover:bg-white"
+      }`}
+    >
+      {selected ? (
+        <span className="absolute inset-y-0 left-0 w-1 bg-[#08736e]" />
+      ) : null}
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase text-steel">
+            <StatusDot tone={item.openCaseCount ? "active" : "done"} />
+            {item.openCaseCount ? "Aktívny dlžník" : "Bez otvorených prípadov"}
+          </div>
+          <div className="mt-2 truncate text-[15px] font-semibold">
+            {item.name}
+          </div>
+          <div className="mt-0.5 truncate text-xs text-steel">
+            {item.email ?? item.ico ? item.email ?? `IČO ${item.ico}` : "Kontakt nie je doplnený"}
+          </div>
+        </div>
+        <div className="shrink-0 text-right">
+          <div className="text-sm font-semibold">
+            {formatDebtorAmounts(item.openAmounts)}
+          </div>
+          <div className="mt-1 text-xs text-steel">
+            {item.openCaseCount} {slovakOpenCaseLabel(item.openCaseCount)}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 flex items-center justify-between text-xs text-steel">
+        <span>{item.caseCount} {slovakCaseLabel(item.caseCount)}</span>
+        <span>
+          {item.lastCaseAt ? `Naposledy ${formatDate(item.lastCaseAt)}` : "Bez faktúr"}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function DebtorDetailPanel({
+  item,
+  detail,
+  loading,
+  onBack,
+  onOpenCase
+}: {
+  item: DashboardDebtor;
+  detail: DashboardDebtorDetail | null;
+  loading: boolean;
+  onBack: () => void;
+  onOpenCase: (item: DashboardCase) => void;
+}) {
+  return (
+    <>
+      <header className="flex min-h-[88px] items-center gap-3 border-b border-zincLine px-6 py-4">
+        <button
+          type="button"
+          title="Späť na zoznam"
+          aria-label="Späť na zoznam dlžníkov"
+          onClick={onBack}
+          className="flex h-9 w-9 shrink-0 items-center justify-center border border-zincLine hover:border-ink xl:hidden"
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </button>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-xs text-steel">
+            <Users className="h-3.5 w-3.5" />
+            <span>{item.caseCount} {slovakCaseLabel(item.caseCount)}</span>
+            <span>·</span>
+            <span>
+              {item.openCaseCount} {slovakOpenCaseLabel(item.openCaseCount)}
+            </span>
+          </div>
+          <h2 className="mt-1 truncate text-2xl font-semibold">{item.name}</h2>
+        </div>
+      </header>
+
+      <div className="xl:max-h-[calc(100vh-88px)] xl:overflow-y-auto">
+        <div className="space-y-6 p-6">
+          <div className="grid grid-cols-3 gap-px border border-zincLine bg-zincLine">
+            <DebtorMetric label="Otvorený dlh" value={formatDebtorAmounts(item.openAmounts)} />
+            <DebtorMetric label="Otvorené" value={String(item.openCaseCount)} />
+            <DebtorMetric label="Uzavreté" value={String(item.closedCaseCount)} />
+          </div>
+
+          <section>
+            <SectionTitle title="Údaje dlžníka" icon={Users} />
+            <div className="mt-3 grid border border-zincLine sm:grid-cols-2">
+              <DebtorField label="Email" value={item.email} />
+              <DebtorField label="IČO" value={item.ico} />
+              <DebtorField label="DIČ" value={item.dic} />
+              <DebtorField label="IČ DPH" value={item.icDph} />
+              <div className="border-t border-zincLine p-3 sm:col-span-2">
+                <div className="text-xs text-steel">Adresa</div>
+                <div className="mt-1 text-sm font-medium">
+                  {item.address ?? "Nezadaná"}
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle title="Faktúry a prípady" icon={FileText} />
+            <div className="mt-3 border border-zincLine">
+              {loading ? (
+                <div className="flex items-center gap-2 p-4 text-sm text-steel">
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                  Načítavam históriu dlžníka…
+                </div>
+              ) : detail?.cases.length ? (
+                detail.cases.map((caseItem) => (
+                  <button
+                    key={caseItem.id}
+                    type="button"
+                    onClick={() => onOpenCase(caseItem)}
+                    className="flex w-full items-center justify-between gap-4 border-b border-zincLine p-4 text-left last:border-b-0 hover:bg-[#f8f8f5]"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <StatusDot
+                          tone={(statusMeta[caseItem.status]?.tone ?? "neutral")}
+                        />
+                        <span className="truncate text-xs font-semibold uppercase text-steel">
+                          {statusMeta[caseItem.status]?.label ?? caseItem.status}
+                        </span>
+                      </div>
+                      <div className="mt-1.5 truncate text-sm font-semibold">
+                        {caseItem.invoiceNumber ?? "Bez čísla faktúry"}
+                      </div>
+                      <div className="mt-0.5 text-xs text-steel">
+                        {caseItem.dueDate
+                          ? `Splatnosť ${formatDate(caseItem.dueDate)}`
+                          : "Bez dátumu splatnosti"}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-right text-sm font-semibold">
+                      {formatMoney(caseItem.amountTotal, caseItem.currency)}
+                    </div>
+                  </button>
+                ))
+              ) : (
+                <EmptyCompact text="K dlžníkovi nie sú priradené žiadne faktúry." />
+              )}
+            </div>
+          </section>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function DebtorMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 bg-white p-3">
+      <div className="text-xs text-steel">{label}</div>
+      <div className="mt-1 truncate text-sm font-semibold" title={value}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function DebtorField({
+  label,
+  value
+}: {
+  label: string;
+  value: string | null;
+}) {
+  return (
+    <div className="border-t border-zincLine p-3 first:border-t-0 sm:[&:nth-child(-n+2)]:border-t-0 sm:[&:nth-child(even)]:border-l">
+      <div className="text-xs text-steel">{label}</div>
+      <div className="mt-1 truncate text-sm font-medium" title={value ?? undefined}>
+        {value ?? "Nezadané"}
+      </div>
+    </div>
   );
 }
 
@@ -1613,6 +1996,38 @@ export function summarizeCases(cases: DashboardCase[]) {
   );
 }
 
+export function summarizeDebtors(debtors: DashboardDebtor[]) {
+  return debtors.reduce(
+    (summary, item) => {
+      summary.active += item.openCaseCount > 0 ? 1 : 0;
+      summary.withoutEmail += item.email ? 0 : 1;
+      summary.cases += item.caseCount;
+      return summary;
+    },
+    { total: debtors.length, active: 0, withoutEmail: 0, cases: 0 }
+  );
+}
+
+export function filterDebtors(
+  debtors: DashboardDebtor[],
+  filter: DebtorFilterId,
+  query: string
+): DashboardDebtor[] {
+  const normalized = query.trim().toLocaleLowerCase("sk");
+  return debtors.filter((item) => {
+    const matchesFilter =
+      filter === "ALL" ||
+      (filter === "ACTIVE" && item.openCaseCount > 0) ||
+      (filter === "WITHOUT_EMAIL" && !item.email);
+    if (!matchesFilter || !normalized) {
+      return matchesFilter;
+    }
+    return [item.name, item.email, item.ico, item.dic, item.icDph, item.address].some(
+      (value) => value?.toLocaleLowerCase("sk").includes(normalized)
+    );
+  });
+}
+
 export function filterCases(
   cases: DashboardCase[],
   filter: FilterId,
@@ -1648,11 +2063,24 @@ export function filterCases(
 function navViewTitle(view: NavView) {
   return {
     CASES: "Prípady",
+    DEBTORS: "Dlžníci",
     COMMUNICATIONS: "Komunikácia",
     WORKFLOW: "Workflow",
     LEGAL: "Právne kroky",
     ARCHIVE: "Archív"
   }[view];
+}
+
+function debtorFilterOptions(counts: ReturnType<typeof summarizeDebtors>) {
+  return [
+    { id: "ALL" as const, label: "Všetci", count: counts.total },
+    { id: "ACTIVE" as const, label: "Aktívni", count: counts.active },
+    {
+      id: "WITHOUT_EMAIL" as const,
+      label: "Bez emailu",
+      count: counts.withoutEmail
+    }
+  ];
 }
 
 function filterOptions(counts: ReturnType<typeof summarizeCases>) {
@@ -1706,6 +2134,35 @@ function formatMoney(amount: number | null, currency: string | null) {
     style: "currency",
     currency: currency ?? "EUR"
   }).format(amount);
+}
+
+function formatDebtorAmounts(amounts: DashboardDebtor["openAmounts"]) {
+  if (!amounts.length) {
+    return "Bez otvoreného dlhu";
+  }
+  return amounts
+    .map(({ amount, currency }) => formatMoney(amount, currency))
+    .join(" + ");
+}
+
+function slovakCaseLabel(count: number) {
+  if (count === 1) {
+    return "faktúra";
+  }
+  if (count >= 2 && count <= 4) {
+    return "faktúry";
+  }
+  return "faktúr";
+}
+
+function slovakOpenCaseLabel(count: number) {
+  if (count === 1) {
+    return "otvorený";
+  }
+  if (count >= 2 && count <= 4) {
+    return "otvorené";
+  }
+  return "otvorených";
 }
 
 function formatDate(value: string) {
