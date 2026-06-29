@@ -246,6 +246,34 @@ export function buildCustomerInvoiceClarificationRequest(input: {
   );
 }
 
+export function buildCustomerMultiAttachmentClarificationRequest(input: {
+  attachmentNames: string[];
+  question?: string | null;
+}): CollectionTemplate {
+  return template(
+    "FAKTURIO: potrebujeme upresniť priložené dokumenty",
+    [
+      "Dobrý deň,",
+      "",
+      "v prijatom emaile sme našli viac dokumentov a nevieme ich bezpečne automaticky rozdeliť.",
+      input.question ||
+        "Prosíme, potvrďte, ktoré dokumenty sú samostatné faktúry a ktoré sú prílohy k jednej faktúre.",
+      "",
+      "Prijaté dokumenty:",
+      ...input.attachmentNames.map((name, index) => `${index + 1}. ${name}`),
+      "",
+      "Môžete odpovedať napríklad:",
+      "1 a 2 sú samostatné faktúry",
+      "alebo",
+      "1 je faktúra, 2 a 3 sú prílohy k faktúre 1",
+      "",
+      "Kým to nepotvrdíte, automatické založenie prípadu pozastavíme.",
+      "",
+      "Ďakujeme."
+    ]
+  );
+}
+
 export function buildCustomerAssistantAcknowledgement(input: {
   invoiceNumber: string | null;
   summary: string;

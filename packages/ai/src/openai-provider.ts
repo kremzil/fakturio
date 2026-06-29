@@ -6,9 +6,11 @@ import {
   CustomerMessageInput,
   DebtorReplyInput,
   GenerateEmailInput,
+  InvoiceEmailAttachmentTriageInput,
   InvoiceExtractionInput,
   customerMessageClassificationSchema,
   debtorReplyClassificationSchema,
+  invoiceEmailAttachmentTriageResultSchema,
   invoiceExtractionResultSchema
 } from "@fakturio/shared";
 import { buildInvoiceFileInput } from "./input";
@@ -70,6 +72,71 @@ export class OpenAiProvider implements AiProvider {
       ...parsed,
       rawResult: response
     };
+  }
+
+  async classifyInvoiceEmailAttachments(input: InvoiceEmailAttachmentTriageInput) {
+    const content = [
+      {
+        type: "input_text" as const,
+        text: [
+          "Classify this inbound customer email attachment set before invoice intake.",
+          "Decide whether the supported attachments are separate invoices, one invoice with supporting documents, or too ambiguous and requiring customer clarification.",
+          "Use SEPARATE_INVOICES only when each primary invoice is clearly a different invoice.",
+          "Use SINGLE_INVOICE_WITH_SUPPORTING_DOCUMENTS only when exactly one primary invoice is clear and other files are supporting documents for that same case.",
+          "Use NEEDS_CUSTOMER_CLARIFICATION when uncertain. Do not guess.",
+          "",
+          `Subject:\n${input.subject ?? "(none)"}`,
+          `Email body:\n${input.messageText ?? "(none)"}`,
+          `Attachment refs:\n${JSON.stringify(input.attachments.map(({ bytes, ...attachment }) => attachment), null, 2)}`
+        ].join("\n")
+      },
+      ...input.attachments.flatMap((attachment) => [
+        {
+          type: "input_text" as const,
+          text: `Attachment index ${attachment.index}: ${attachment.fileName} (${attachment.mimeType})`
+        },
+        buildInvoiceFileInput({
+          fileName: attachment.fileName,
+          mimeType: attachment.mimeType,
+          base64: Buffer.from(attachment.bytes).toString("base64")
+        })
+      ])
+    ];
+
+    const response = await this.client.responses.parse({
+      model: this.model,
+      store: false,
+      temperature: 0,
+      input: [
+        {
+          role: "system",
+          content:
+            "You classify sets of invoice-related email attachments for a Slovak B2B invoice collection system. Return structured output only. Never create invoice data or amounts. Only classify how attachments should be routed."
+        },
+        {
+          role: "user",
+          content
+        }
+      ],
+      text: {
+        format: zodTextFormat(
+          invoiceEmailAttachmentTriageResultSchema,
+          "invoice_email_attachment_triage"
+        )
+      }
+    });
+
+    const parsed = extractParsedResponse(
+      response,
+      invoiceEmailAttachmentTriageResultSchema.safeParse.bind(
+        invoiceEmailAttachmentTriageResultSchema
+      )
+    );
+    if (!parsed) {
+      throw new Error("OpenAI response did not contain attachment triage data.");
+    }
+
+    return parsed;
   }
 
   async classifyDebtorReply(input: DebtorReplyInput) {

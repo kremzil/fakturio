@@ -1,4 +1,5 @@
 export * from "./invoice";
+export * from "./invoice-attachment-triage";
 export * from "./customer-message";
 export * from "./intake";
 export * from "./case-status";

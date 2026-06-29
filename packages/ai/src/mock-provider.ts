@@ -8,6 +8,8 @@ import {
   DebtorReplyInput,
   GenerateEmailInput,
   GeneratedEmail,
+  InvoiceEmailAttachmentTriageInput,
+  InvoiceEmailAttachmentTriageResult,
   InvoiceExtractionInput,
   emptyCustomerExtractedInvoiceFields,
   emptyInvoiceExtractionResult
@@ -55,6 +57,56 @@ export class MockAiProvider implements AiProvider {
         fileType: input.mimeType,
         fileSize: input.bytes.byteLength
       }
+    };
+  }
+
+  async classifyInvoiceEmailAttachments(
+    input: InvoiceEmailAttachmentTriageInput
+  ): Promise<InvoiceEmailAttachmentTriageResult> {
+    const lower = `${input.subject ?? ""}\n${input.messageText ?? ""}\n${input.attachments.map((attachment) => attachment.fileName).join("\n")}`.toLowerCase();
+    if (lower.includes("ambiguous") || lower.includes("nejas")) {
+      return {
+        decision: "NEEDS_CUSTOMER_CLARIFICATION",
+        confidence: 0.61,
+        groups: [],
+        customerQuestion: "Prosíme upresniť, ktoré dokumenty sú faktúry a ktoré prílohy.",
+        warnings: ["MOCK_AI režim: viac dokumentov je označených ako nejasných."]
+      };
+    }
+
+    const supportingIndexes = input.attachments
+      .filter((attachment) => /support|priloha|príloha|dodaci|dodací|objednavka|objednávka|zmluva/u.test(attachment.fileName.toLowerCase()))
+      .map((attachment) => attachment.index);
+    const primaryCandidates = input.attachments.filter(
+      (attachment) => !supportingIndexes.includes(attachment.index)
+    );
+
+    if (supportingIndexes.length > 0 && primaryCandidates.length === 1) {
+      return {
+        decision: "SINGLE_INVOICE_WITH_SUPPORTING_DOCUMENTS",
+        confidence: 0.94,
+        groups: [
+          {
+            primaryInvoiceAttachmentIndex: primaryCandidates[0]?.index ?? 0,
+            supportingAttachmentIndexes: supportingIndexes,
+            reason: "Mock filename heuristic found one invoice and supporting documents."
+          }
+        ],
+        customerQuestion: null,
+        warnings: ["MOCK_AI režim: triage je ukážkový."]
+      };
+    }
+
+    return {
+      decision: "SEPARATE_INVOICES",
+      confidence: 0.94,
+      groups: input.attachments.map((attachment) => ({
+        primaryInvoiceAttachmentIndex: attachment.index,
+        supportingAttachmentIndexes: [],
+        reason: "Mock filename heuristic treats each supported file as a separate invoice."
+      })),
+      customerQuestion: null,
+      warnings: ["MOCK_AI režim: triage je ukážkový."]
     };
   }
 

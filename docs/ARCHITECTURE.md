@@ -23,6 +23,7 @@ UI upload or inbound email
   -> apps/web route handler
   -> inbound email address resolves Organization when the source is email
   -> packages/intake normalizes source as UPLOAD or EMAIL
+  -> packages/ai triages multiple supported email attachments before parsing
   -> packages/storage stores original file
   -> packages/ai extracts structured invoice data
   -> packages/intake resolves Customer/Debtor within Organization
@@ -30,7 +31,7 @@ UI upload or inbound email
   -> apps/worker later runs CaseWorkflow
 ```
 
-Email intake stores inbound messages as `Communication` records. Each supported PDF/image attachment becomes an `InvoiceDocument` and follows the same parser/review/confirm pipeline as manual upload. Unsupported email attachments are recorded as skipped metadata; emails without supported attachments create a `MANUAL_REVIEW_REQUIRED` case.
+Email intake stores inbound messages as `Communication` records. A single supported PDF/image attachment follows the same parser/review/confirm pipeline as manual upload. Multiple supported attachments are triaged first. At confidence `>= 0.90`, separate invoice groups create separate cases, while supporting documents are retained as `CommunicationAttachment` history on the related case. Low-confidence or invalid grouping creates one `MANUAL_REVIEW_REQUIRED` container case, stores all accepted documents as communication attachments, and asks the customer to clarify which documents are invoices versus attachments. Unsupported email attachments are recorded as skipped metadata; emails without supported attachments create a `MANUAL_REVIEW_REQUIRED` case.
 
 ## Organization And Counterparty Matching
 
@@ -113,7 +114,7 @@ Inbound processing order:
 3. Match `In-Reply-To` or `References` to a stored outbound debtor `Communication`.
 4. Otherwise resolve an active organization `EmailIntakeAddress` and process the message as invoice intake.
 
-Customer email assistant handling is separate from debtor reply handling. When an emailed invoice creates a `MANUAL_REVIEW_REQUIRED` case because required invoice fields are missing, intake sends the original sender a templated clarification request with a signed `clarify+...` reply address. Replies and case-alias emails without invoice attachments are classified through Structured Outputs. The assistant can fill only missing invoice fields, save customer notes, update an empty debtor contact, answer case-status questions and ask follow-up questions. When a case is valid for confirmation, status replies may include a signed confirmation link. Link `GET` is read-only; only explicit `POST` confirms the case and requests workflow start. The assistant cannot overwrite reviewed amounts, close a case, mark a case paid or perform legal/collection actions from email.
+Customer email assistant handling is separate from debtor reply handling. When an emailed invoice creates a `MANUAL_REVIEW_REQUIRED` case because required invoice fields are missing, intake sends the original sender a templated clarification request with a signed `clarify+...` reply address. The same signed clarification path handles pending multi-attachment clarification: a clear reply reuses saved `CommunicationAttachment` objects through `StorageProvider.getObject()`, turns the container case into the first parsed invoice case, and creates additional cases for other primary invoices. Replies and case-alias emails without invoice attachments are classified through Structured Outputs. The assistant can fill only missing invoice fields, save customer notes, update an empty debtor contact, answer case-status questions and ask follow-up questions. When a case is valid for confirmation, status replies may include a signed confirmation link. Link `GET` is read-only; only explicit `POST` confirms the case and requests workflow start. The assistant cannot overwrite reviewed amounts, close a case, mark a case paid or perform legal/collection actions from email.
 
 Replies are idempotent by provider message id. Web intake stores `Communication(INBOUND)`, accepted `CommunicationAttachment` objects and a `DEBTOR_REPLY_RECEIVED` command without calling AI. Reply attachments are limited to 10 files, 10 MB each and 20 MB total, with PDF/JPEG/PNG/WEBP allowlisted. Rejected attachment metadata remains in the communication audit payload, but rejected bytes are not written to storage. The worker classifies readable text through `AiProvider` and applies deterministic policy. Attachments are retained for audit but never treated as proof of payment.
 

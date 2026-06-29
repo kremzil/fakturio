@@ -62,6 +62,7 @@ npm run dev
 ```text
 source upload/email
   -> email alias resolves Organization when source is email
+  -> multi-attachment email triage when more than one supported file is attached
   -> StorageProvider.putObject()
   -> AiProvider.extractInvoice()
   -> resolve Customer/Debtor inside Organization
@@ -72,6 +73,8 @@ source upload/email
 ```
 
 Контрагенты не создаются каждый раз заново: `packages/intake` ищет существующего `Debtor` внутри `Organization` по IČO, IČ DPH, DIČ, email, нормализованному названию и адресу. Повторные фактуры одного должника должны попадать в одну карточку контрагента.
+
+Если email содержит несколько поддерживаемых PDF/JPG/PNG/WEBP вложений, intake сначала вызывает `AiProvider.classifyInvoiceEmailAttachments()`. Автоматическое разделение разрешено только при confidence `>= 0.90` и валидной структуре групп. Тогда отдельные фактуры создают отдельные cases, а приложения к одной фактуре сохраняются как `CommunicationAttachment` в истории дела. При сомнении создаётся один `MANUAL_REVIEW_REQUIRED` case-контейнер, все документы сохраняются в storage, заказчику отправляется письмо с signed `clarify+...` reply-to, и после его ответа сервис перечитывает вложения через `StorageProvider.getObject()` для повторного parse/split.
 
 После подтверждения фактуры case переходит в `WAITING_FOR_DUE_DATE`. Worker стартует Temporal workflow с детерминированным id `case-{caseId}`, ждёт дату splatnosti из фактуры и отправляет заказчику email с двумя действиями:
 

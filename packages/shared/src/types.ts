@@ -1,5 +1,9 @@
 import type { CustomerMessageClassification } from "./customer-message";
 import type { DebtorReplyClassification, InvoiceExtractionResult } from "./invoice";
+import type {
+  InvoiceEmailAttachmentRef,
+  InvoiceEmailAttachmentTriageResult
+} from "./invoice-attachment-triage";
 
 export type InvoiceExtractionInput = {
   fileName: string;
@@ -27,6 +31,17 @@ export type CustomerMessageInput = {
     currency: string | null;
     status: string;
   }>;
+};
+
+export type InvoiceEmailAttachmentTriageInput = {
+  organizationId: string;
+  subject?: string | null;
+  messageText?: string | null;
+  attachments: Array<
+    InvoiceEmailAttachmentRef & {
+      bytes: Uint8Array;
+    }
+  >;
 };
 
 export type GenerateEmailInput = {
@@ -60,6 +75,7 @@ export type CaseSummary = {
 
 export interface AiProvider {
   extractInvoice(input: InvoiceExtractionInput): Promise<InvoiceExtractionResult & { rawResult: unknown }>;
+  classifyInvoiceEmailAttachments(input: InvoiceEmailAttachmentTriageInput): Promise<InvoiceEmailAttachmentTriageResult>;
   classifyDebtorReply(input: DebtorReplyInput): Promise<DebtorReplyClassification>;
   classifyCustomerMessage(input: CustomerMessageInput): Promise<CustomerMessageClassification>;
   generateDebtorEmail(input: GenerateEmailInput): Promise<GeneratedEmail>;

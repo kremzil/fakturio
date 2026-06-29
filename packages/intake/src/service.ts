@@ -4,6 +4,7 @@ import { createAiProvider } from "@fakturio/ai";
 import { prisma } from "@fakturio/db";
 import {
   buildCustomerInvoiceClarificationRequest,
+  buildCustomerMultiAttachmentClarificationRequest,
   createEmailProvider,
   type InboundEmail,
   type InboundEmailAttachment
@@ -16,6 +17,7 @@ import {
   isAcceptedInvoiceMimeType,
   parseIsoDate,
   requireInboundReplyTokenSecret,
+  validateInvoiceEmailAttachmentTriage,
   validateInvoiceForWorkflow
 } from "@fakturio/shared";
 import { createStorageProvider } from "@fakturio/storage";
@@ -32,6 +34,14 @@ import type {
 export type EmailIntakeResult = {
   cases: IntakeCaseResult[];
   skippedAttachments: Array<{ fileName: string; mimeType: string; reason: string }>;
+};
+
+export type MultiAttachmentClarificationResult = {
+  caseIds: string[];
+  communicationId: string | null;
+  status: string;
+  replySent: boolean;
+  stillNeedsClarification: boolean;
 };
 
 export class InvoiceIntakeService {
@@ -79,6 +89,10 @@ export class InvoiceIntakeService {
       return { cases: [result], skippedAttachments };
     }
 
+    if (acceptedAttachments.length > 1) {
+      return this.createFromMultiAttachmentEmail(input, acceptedAttachments, skippedAttachments);
+    }
+
     const cases: IntakeCaseResult[] = [];
     for (const attachment of acceptedAttachments) {
       const idempotencyKey = inboundInvoiceIdempotencyKey(input.email, attachment);
@@ -104,6 +118,276 @@ export class InvoiceIntakeService {
     return { cases, skippedAttachments };
   }
 
+  async resolveMultiAttachmentClarification(input: {
+    organizationId: string;
+    caseId: string;
+    email: InboundEmail;
+  }): Promise<MultiAttachmentClarificationResult | null> {
+    const existingReply = await prisma.communication.findUnique({
+      where: {
+        idempotencyKey: `customer-multi-attachment-reply:${input.email.provider}:${input.email.providerId}:${input.caseId}`
+      },
+      include: { case: true }
+    });
+    if (existingReply) {
+      return {
+        caseIds: [existingReply.caseId],
+        communicationId: existingReply.id,
+        status: existingReply.case.status,
+        replySent: false,
+        stillNeedsClarification: existingReply.case.status === "MANUAL_REVIEW_REQUIRED"
+      };
+    }
+
+    const pending = await prisma.communication.findFirst({
+      where: {
+        caseId: input.caseId,
+        case: { organizationId: input.organizationId },
+        direction: "INBOUND",
+        rawPayload: {
+          path: ["pendingMultiAttachmentClarification"],
+          not: Prisma.JsonNull
+        }
+      },
+      include: { attachments: true, case: true },
+      orderBy: { createdAt: "desc" }
+    });
+    if (!pending || pending.attachments.length < 2) {
+      return null;
+    }
+
+    const replyCommunication = await createInboundCommunication(
+      input.caseId,
+      input.email,
+      { kind: "customer-multi-attachment-clarification-reply" },
+      `customer-multi-attachment-reply:${input.email.provider}:${input.email.providerId}:${input.caseId}`
+    );
+
+    const files = await Promise.all(
+      pending.attachments.map(async (attachment, index) => {
+        const object = await this.deps.storage.getObject({
+          bucket: attachment.storageBucket,
+          key: attachment.storageKey
+        });
+        return {
+          index,
+          fileName: attachment.originalName,
+          mimeType: attachment.mimeType,
+          sizeBytes: object.sizeBytes ?? attachment.sizeBytes,
+          sha256: attachment.sha256,
+          bytes: object.body
+        };
+      })
+    );
+
+    const triage = validateInvoiceEmailAttachmentTriage(
+      await this.deps.ai.classifyInvoiceEmailAttachments({
+        organizationId: input.organizationId,
+        subject: input.email.subject,
+        messageText: input.email.textBody,
+        attachments: files
+      }),
+      files.length
+    );
+
+    if (triage.decision === "NEEDS_CUSTOMER_CLARIFICATION") {
+      await this.sendCustomerMultiAttachmentClarificationRequest({
+        caseId: input.caseId,
+        customerEmail: input.email.from,
+        attachmentNames: files.map((file) => file.fileName),
+        question: triage.customerQuestion,
+        idempotencyKey: `customer-multi-attachment-clarification-followup:${input.email.provider}:${input.email.providerId}:${input.caseId}`
+      });
+      await prisma.caseEvent.create({
+        data: {
+          caseId: input.caseId,
+          actorType: "AI",
+          type: CASE_EVENT_TYPES.manualReviewRequired,
+          note: "Customer multi-attachment clarification was still ambiguous.",
+          payload: {
+            communicationId: replyCommunication.id,
+            warnings: triage.warnings
+          }
+        }
+      });
+      return {
+        caseIds: [input.caseId],
+        communicationId: replyCommunication.id,
+        status: "MANUAL_REVIEW_REQUIRED",
+        replySent: true,
+        stillNeedsClarification: true
+      };
+    }
+
+    const caseIds: string[] = [];
+    for (const [groupIndex, group] of triage.groups.entries()) {
+      const primary = files[group.primaryInvoiceAttachmentIndex];
+      if (!primary) {
+        throw new Error("Attachment triage selected a missing primary invoice.");
+      }
+      const supporting = group.supportingAttachmentIndexes.map((index) => {
+        const file = files[index];
+        if (!file) {
+          throw new Error("Attachment triage selected a missing supporting document.");
+        }
+        return file;
+      });
+
+      if (groupIndex === 0) {
+        await this.populateExistingCaseFromFile({
+          organizationId: input.organizationId,
+          caseId: input.caseId,
+          file: primary,
+          sourceType: "EMAIL",
+          actor: { actorType: "EMAIL_PROVIDER" },
+          caseParsedNote: "Multi-attachment clarification selected this document as the primary invoice.",
+          communicationId: pending.id
+        });
+        caseIds.push(input.caseId);
+      } else {
+        const collectionCase = await prisma.case.create({
+          data: {
+            organizationId: input.organizationId,
+            sourceType: "EMAIL",
+            status: "RECEIVED",
+            events: {
+              create: {
+                actorType: "EMAIL_PROVIDER",
+                type: CASE_EVENT_TYPES.caseCreated,
+                note: `Case created from multi-attachment clarification for ${primary.fileName}.`
+              }
+            }
+          }
+        });
+        const communication = await cloneInboundCommunicationForSplitCase({
+          caseId: collectionCase.id,
+          sourceCommunication: pending,
+          primaryFileName: primary.fileName
+        });
+        await this.storeCommunicationAttachments({
+          organizationId: input.organizationId,
+          caseId: collectionCase.id,
+          communicationId: communication.id,
+          attachments: supporting
+        });
+        await this.populateExistingCaseFromFile({
+          organizationId: input.organizationId,
+          caseId: collectionCase.id,
+          file: primary,
+          sourceType: "EMAIL",
+          actor: { actorType: "EMAIL_PROVIDER" },
+          caseParsedNote: "Case created from customer clarification of multiple attachments.",
+          communicationId: communication.id
+        });
+        caseIds.push(collectionCase.id);
+      }
+    }
+
+    await prisma.caseEvent.create({
+      data: {
+        caseId: input.caseId,
+        actorType: "AI",
+        type: CASE_EVENT_TYPES.statusChanged,
+        note: `Multi-attachment clarification resolved into ${caseIds.length} case(s).`,
+        payload: {
+          communicationId: replyCommunication.id,
+          caseIds,
+          decision: triage.decision,
+          confidence: triage.confidence
+        }
+      }
+    });
+
+    return {
+      caseIds,
+      communicationId: replyCommunication.id,
+      status: "PARSED",
+      replySent: false,
+      stillNeedsClarification: false
+    };
+  }
+
+  private async createFromMultiAttachmentEmail(
+    input: CreateFromEmailInput,
+    acceptedAttachments: InboundEmailAttachment[],
+    skippedAttachments: EmailIntakeResult["skippedAttachments"]
+  ): Promise<EmailIntakeResult> {
+    const attachmentRefs = acceptedAttachments.map((attachment, index) => ({
+      index,
+      fileName: attachment.fileName,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.bytes.byteLength,
+      sha256: hashBytes(attachment.bytes),
+      bytes: attachment.bytes
+    }));
+
+    const triage = validateInvoiceEmailAttachmentTriage(
+      await this.deps.ai.classifyInvoiceEmailAttachments({
+        organizationId: input.organizationId,
+        subject: input.email.subject,
+        messageText: input.email.textBody,
+        attachments: attachmentRefs
+      }),
+      acceptedAttachments.length
+    );
+
+    if (triage.decision === "NEEDS_CUSTOMER_CLARIFICATION") {
+      const result = await this.createMultiAttachmentManualReviewCase(
+        input.organizationId,
+        input.email,
+        acceptedAttachments,
+        skippedAttachments,
+        triage
+      );
+      return { cases: [result], skippedAttachments };
+    }
+
+    const cases: IntakeCaseResult[] = [];
+    for (const group of triage.groups) {
+      const primary = acceptedAttachments[group.primaryInvoiceAttachmentIndex];
+      if (!primary) {
+        throw new Error("Attachment triage selected a missing primary invoice.");
+      }
+      const supportingAttachments = group.supportingAttachmentIndexes.map((index) => {
+        const attachment = acceptedAttachments[index];
+        if (!attachment) {
+          throw new Error("Attachment triage selected a missing supporting document.");
+        }
+        return attachment;
+      });
+      const idempotencyKey = inboundInvoiceIdempotencyKey(input.email, primary);
+      const existing = await findExistingInboundCase(idempotencyKey);
+      if (existing) {
+        cases.push(existing);
+        continue;
+      }
+
+      cases.push(
+        await this.createCaseFromFile({
+          organizationId: input.organizationId,
+          file: primary,
+          sourceType: "EMAIL",
+          actor: { actorType: "EMAIL_PROVIDER" },
+          caseCreatedNote: `Inbound email ${input.email.providerId} attachment ${primary.fileName}.`,
+          email: input.email,
+          communicationIdempotencyKey: idempotencyKey,
+          supportingAttachments,
+          communicationExtraPayload: {
+            triage: {
+              decision: triage.decision,
+              confidence: triage.confidence,
+              reason: group.reason
+            },
+            supportingAttachmentNames: supportingAttachments.map((attachment) => attachment.fileName),
+            skippedAttachments
+          }
+        })
+      );
+    }
+
+    return { cases, skippedAttachments };
+  }
+
   private async createCaseFromFile(input: {
     organizationId: string;
     file: InvoiceFilePayload;
@@ -112,6 +396,8 @@ export class InvoiceIntakeService {
     caseCreatedNote: string;
     email?: InboundEmail;
     communicationIdempotencyKey?: string;
+    supportingAttachments?: InboundEmailAttachment[];
+    communicationExtraPayload?: Record<string, unknown>;
   }): Promise<IntakeCaseResult> {
     const collectionCase = await prisma.case.create({
       data: {
@@ -135,7 +421,7 @@ export class InvoiceIntakeService {
         communication = await createInboundCommunication(
           collectionCase.id,
           input.email,
-          undefined,
+          input.communicationExtraPayload,
           input.communicationIdempotencyKey
         );
       } catch (error) {
@@ -177,6 +463,15 @@ export class InvoiceIntakeService {
           sha256: hashBytes(input.file.bytes)
         }
       });
+
+      if (communication && input.supportingAttachments?.length) {
+        await this.storeCommunicationAttachments({
+          organizationId: input.organizationId,
+          caseId: collectionCase.id,
+          communicationId: communication.id,
+          attachments: input.supportingAttachments
+        });
+      }
     } catch (error) {
       if (stored) {
         await this.deps.storage
@@ -291,6 +586,162 @@ export class InvoiceIntakeService {
     }
   }
 
+  private async storeCommunicationAttachments(input: {
+    organizationId: string;
+    caseId: string;
+    communicationId: string;
+    attachments: InvoiceFilePayload[];
+  }): Promise<void> {
+    for (const attachment of input.attachments) {
+      const stored = await this.deps.storage.putObject({
+        organizationId: input.organizationId,
+        caseId: input.caseId,
+        fileName: attachment.fileName,
+        contentType: attachment.mimeType,
+        body: attachment.bytes,
+        kind: "communication-attachment"
+      });
+      await prisma.communicationAttachment.create({
+        data: {
+          communicationId: input.communicationId,
+          storageBucket: stored.bucket,
+          storageKey: stored.key,
+          originalName: attachment.fileName,
+          mimeType: attachment.mimeType,
+          sizeBytes: stored.sizeBytes,
+          sha256: hashBytes(attachment.bytes)
+        }
+      });
+    }
+  }
+
+  private async populateExistingCaseFromFile(input: {
+    organizationId: string;
+    caseId: string;
+    file: InvoiceFilePayload;
+    sourceType: "UPLOAD" | "EMAIL";
+    actor: IntakeActor;
+    caseParsedNote: string;
+    communicationId: string | null;
+  }): Promise<IntakeCaseResult> {
+    const stored = await this.deps.storage.putObject({
+      organizationId: input.organizationId,
+      caseId: input.caseId,
+      fileName: input.file.fileName,
+      contentType: input.file.mimeType,
+      body: input.file.bytes
+    });
+
+    await prisma.invoiceDocument.create({
+      data: {
+        caseId: input.caseId,
+        communicationId: input.communicationId,
+        sourceType: input.sourceType,
+        storageBucket: stored.bucket,
+        storageKey: stored.key,
+        originalName: input.file.fileName,
+        mimeType: input.file.mimeType,
+        sizeBytes: stored.sizeBytes,
+        sha256: hashBytes(input.file.bytes)
+      }
+    });
+
+    try {
+      const parsed = await this.deps.ai.extractInvoice({
+        fileName: input.file.fileName,
+        mimeType: input.file.mimeType,
+        bytes: input.file.bytes
+      });
+      const debtorResolution = await resolveDebtor(input.organizationId, parsed.debtor);
+      const customerResolution = await resolveCustomer(input.organizationId, parsed.supplier);
+      const validation = validateInvoiceForWorkflow({
+        invoiceNumber: parsed.invoiceNumber,
+        dueDate: parsed.dueDate,
+        amountTotal: parsed.amountTotal,
+        debtorName: parsed.debtor.name,
+        currency: parsed.currency,
+        warnings: parsed.warnings
+      });
+      const warnings = validation.warningsPatch ?? parsed.warnings;
+      const status =
+        parsed.manualReviewRequired || validation.errors.length > 0
+          ? "MANUAL_REVIEW_REQUIRED"
+          : "PARSED";
+
+      await prisma.case.update({
+        where: { id: input.caseId },
+        data: {
+          status,
+          customerId: customerResolution?.customer.id,
+          debtorId: debtorResolution?.debtor.id,
+          invoiceNumber: parsed.invoiceNumber,
+          issueDate: parseIsoDate(parsed.issueDate),
+          dueDate: parseIsoDate(parsed.dueDate),
+          amountTotal: parsed.amountTotal,
+          currency: parsed.currency ?? validation.currencyPatch,
+          supplierSnapshot: parsed.supplier,
+          debtorSnapshot: parsed.debtor,
+          paymentSnapshot: parsed.payment,
+          subjectNote: parsed.subjectNote,
+          aiConfidence: parsed.confidence,
+          warnings,
+          rawAiResult: toJsonValue(parsed.rawResult),
+          events: {
+            create: {
+              actorType: "AI",
+              type:
+                status === "PARSED"
+                  ? CASE_EVENT_TYPES.invoiceParsed
+                  : CASE_EVENT_TYPES.manualReviewRequired,
+              note:
+                status === "PARSED"
+                  ? input.caseParsedNote
+                  : validation.errors.join(" ") || "Manual review required.",
+              payload: {
+                customerMatch: customerResolution
+                  ? {
+                      id: customerResolution.customer.id,
+                      method: customerResolution.matchMethod,
+                      created: customerResolution.created
+                    }
+                  : null,
+                debtorMatch: debtorResolution
+                  ? {
+                      id: debtorResolution.debtor.id,
+                      method: debtorResolution.matchMethod,
+                      created: debtorResolution.created
+                    }
+                  : null
+              }
+            }
+          }
+        }
+      });
+
+      return { caseId: input.caseId, status, parseError: null };
+    } catch (error) {
+      await prisma.case.update({
+        where: { id: input.caseId },
+        data: {
+          status: "MANUAL_REVIEW_REQUIRED",
+          warnings: ["Automatické načítanie zlyhalo. Doplňte údaje manuálne."],
+          events: {
+            create: {
+              actorType: "AI",
+              type: CASE_EVENT_TYPES.manualReviewRequired,
+              note: error instanceof Error ? error.message : "AI parse failed."
+            }
+          }
+        }
+      });
+      return {
+        caseId: input.caseId,
+        status: "MANUAL_REVIEW_REQUIRED",
+        parseError: error instanceof Error ? error.message : "AI parse failed."
+      };
+    }
+  }
+
   private async createManualReviewEmailCase(
     organizationId: string,
     email: InboundEmail,
@@ -340,6 +791,85 @@ export class InvoiceIntakeService {
       caseId: collectionCase.id,
       status: "MANUAL_REVIEW_REQUIRED",
       parseError: "No supported invoice attachment found."
+    };
+  }
+
+  private async createMultiAttachmentManualReviewCase(
+    organizationId: string,
+    email: InboundEmail,
+    acceptedAttachments: InboundEmailAttachment[],
+    skippedAttachments: EmailIntakeResult["skippedAttachments"],
+    triage: {
+      confidence: number;
+      customerQuestion: string | null;
+      warnings: string[];
+    }
+  ): Promise<IntakeCaseResult> {
+    const idempotencyKey = `inbound-invoice:${email.provider}:${email.providerId}:multi-attachment-review`;
+    const existing = await findExistingInboundCase(idempotencyKey);
+    if (existing) {
+      return existing;
+    }
+
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        sourceType: "EMAIL",
+        status: "MANUAL_REVIEW_REQUIRED",
+        warnings: ["Email obsahuje viac dokumentov a vyžaduje potvrdenie zákazníka."],
+        events: {
+          create: {
+            actorType: "EMAIL_PROVIDER",
+            type: CASE_EVENT_TYPES.manualReviewRequired,
+            note: `Inbound email ${email.providerId} contains multiple invoice-like documents.`
+          }
+        }
+      }
+    });
+
+    try {
+      const communication = await createInboundCommunication(
+        collectionCase.id,
+        email,
+        {
+          skippedAttachments,
+          pendingMultiAttachmentClarification: {
+            acceptedAttachmentNames: acceptedAttachments.map((attachment) => attachment.fileName),
+            confidence: triage.confidence,
+            warnings: triage.warnings
+          }
+        },
+        idempotencyKey
+      );
+      await this.storeCommunicationAttachments({
+        organizationId,
+        caseId: collectionCase.id,
+        communicationId: communication.id,
+        attachments: acceptedAttachments
+      });
+      await this.sendCustomerMultiAttachmentClarificationRequest({
+        caseId: collectionCase.id,
+        customerEmail: email.from,
+        attachmentNames: acceptedAttachments.map((attachment) => attachment.fileName),
+        question: triage.customerQuestion,
+        idempotencyKey: `customer-multi-attachment-clarification:${email.provider}:${email.providerId}:${collectionCase.id}`
+      });
+    } catch (error) {
+      await prisma.case.delete({ where: { id: collectionCase.id } }).catch(() => undefined);
+      if (!isUniqueConstraintViolation(error)) {
+        throw error;
+      }
+      const raced = await findExistingInboundCase(idempotencyKey);
+      if (raced) {
+        return raced;
+      }
+      throw error;
+    }
+
+    return {
+      caseId: collectionCase.id,
+      status: "MANUAL_REVIEW_REQUIRED",
+      parseError: "Multiple invoice-like attachments require customer clarification."
     };
   }
 
@@ -436,6 +966,97 @@ export class InvoiceIntakeService {
       })
     ]);
   }
+
+  private async sendCustomerMultiAttachmentClarificationRequest(input: {
+    caseId: string;
+    customerEmail: string | null;
+    attachmentNames: string[];
+    question: string | null;
+    idempotencyKey: string;
+  }): Promise<void> {
+    const to = cleanText(input.customerEmail);
+    if (!to) {
+      return;
+    }
+
+    const existing = await prisma.communication.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+      select: { id: true, status: true }
+    });
+    if (existing?.status === "SENT") {
+      return;
+    }
+
+    const template = buildCustomerMultiAttachmentClarificationRequest({
+      attachmentNames: input.attachmentNames,
+      question: input.question
+    });
+    const replyTo = createCaseClarificationAddress(
+      { caseId: input.caseId, domain: inboundReplyDomain() },
+      requireInboundReplyTokenSecret()
+    );
+    const from = process.env.SES_FROM_EMAIL || "system@example.com";
+    const communication =
+      existing ??
+      (await prisma.communication.create({
+        data: {
+          caseId: input.caseId,
+          direction: "OUTBOUND",
+          channel: "EMAIL",
+          status: "DRAFT",
+          idempotencyKey: input.idempotencyKey,
+          fromAddress: from,
+          toAddress: to,
+          subject: template.subject,
+          textBody: template.textBody,
+          htmlBody: template.htmlBody,
+          rawPayload: {
+            kind: "customer-multi-attachment-clarification-request",
+            replyTo,
+            attachmentNames: input.attachmentNames
+          }
+        },
+        select: { id: true, status: true }
+      }));
+
+    const sent = await this.deps.email.sendEmail({
+      from,
+      to: [to],
+      replyTo: [replyTo],
+      subject: template.subject,
+      textBody: template.textBody,
+      htmlBody: template.htmlBody,
+      metadata: {
+        caseId: input.caseId,
+        kind: "customer-multi-attachment-clarification"
+      }
+    });
+
+    await prisma.$transaction([
+      prisma.communication.update({
+        where: { id: communication.id },
+        data: {
+          status: "SENT",
+          provider: sent.provider,
+          providerId: sent.providerId,
+          messageId: normalizeMessageId(sent.providerId),
+          sentAt: new Date()
+        }
+      }),
+      prisma.caseEvent.create({
+        data: {
+          caseId: input.caseId,
+          actorType: "SYSTEM",
+          type: CASE_EVENT_TYPES.emailSent,
+          note: `Customer multi-attachment clarification request sent to ${to}.`,
+          payload: {
+            communicationId: communication.id,
+            attachmentNames: input.attachmentNames
+          }
+        }
+      })
+    ]);
+  }
 }
 
 export function validateAttachment(file: InvoiceFilePayload): string | null {
@@ -486,6 +1107,57 @@ async function createInboundCommunication(
       textBody: email.textBody,
       htmlBody: email.htmlBody,
       rawPayload,
+      receivedAt: new Date()
+    }
+  });
+}
+
+async function cloneInboundCommunicationForSplitCase(input: {
+  caseId: string;
+  sourceCommunication: {
+    provider: string | null;
+    providerId: string | null;
+    messageId: string | null;
+    inReplyTo: string | null;
+    references: string[];
+    fromAddress: string | null;
+    toAddress: string | null;
+    subject: string | null;
+    textBody: string | null;
+    htmlBody: string | null;
+    rawPayload: Prisma.JsonValue | null;
+  };
+  primaryFileName: string;
+}) {
+  const idempotencyKey = [
+    "inbound-invoice-split",
+    input.sourceCommunication.provider ?? "unknown",
+    input.sourceCommunication.providerId ?? input.sourceCommunication.messageId ?? input.caseId,
+    input.caseId
+  ].join(":");
+
+  return prisma.communication.create({
+    data: {
+      caseId: input.caseId,
+      direction: "INBOUND",
+      channel: "EMAIL",
+      status: "RECEIVED",
+      idempotencyKey,
+      provider: input.sourceCommunication.provider,
+      providerId: input.sourceCommunication.providerId,
+      messageId: input.sourceCommunication.messageId,
+      inReplyTo: input.sourceCommunication.inReplyTo,
+      references: input.sourceCommunication.references,
+      fromAddress: input.sourceCommunication.fromAddress,
+      toAddress: input.sourceCommunication.toAddress,
+      subject: input.sourceCommunication.subject,
+      textBody: input.sourceCommunication.textBody,
+      htmlBody: input.sourceCommunication.htmlBody,
+      rawPayload: {
+        ...jsonRecord(input.sourceCommunication.rawPayload),
+        splitFromCase: true,
+        primaryFileName: input.primaryFileName
+      },
       receivedAt: new Date()
     }
   });
@@ -574,4 +1246,10 @@ function toJsonValue(value: unknown): Prisma.InputJsonValue | undefined {
   }
 
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }

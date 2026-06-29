@@ -12,6 +12,8 @@ Move from SQLite invoice-upload models to PostgreSQL `Case`, `InvoiceDocument`, 
 ## Stage 3: Invoice Intake - Complete baseline
 Implement upload/email intake, review and confirm on the new stack. Store originals through `StorageProvider`, parse through `AiProvider`, and match counterparties inside each organization.
 
+Implemented: multi-attachment email guard with AI triage, strict auto-split threshold, supporting-document history, customer clarification loop and deferred parsing from stored attachments.
+
 ## Stage 4: Temporal Workflow - Complete durable collection loop baseline
 Start durable `CaseWorkflow` per confirmed case. Wait for due date, ask the customer if payment arrived, and branch to paid close or overdue collection.
 

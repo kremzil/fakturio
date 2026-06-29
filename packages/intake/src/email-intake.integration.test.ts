@@ -13,16 +13,35 @@ import { InvoiceIntakeService } from "./service";
 
 const RUN_ID = `it-email-${Date.now()}-${Math.floor(Math.random() * 1e5)}`;
 const organizationId = `${RUN_ID}-org`;
+const storedObjects = new Map<
+  string,
+  { body: Uint8Array; contentType: string; sizeBytes: number }
+>();
 
-const putObject = vi.fn(async (input: Parameters<StorageProvider["putObject"]>[0]) => ({
-  bucket: "test-bucket",
-  key: `${RUN_ID}/${input.caseId}/${input.fileName}`,
-  sizeBytes: input.body.byteLength,
-  contentType: input.contentType
-}));
+const putObject = vi.fn(async (input: Parameters<StorageProvider["putObject"]>[0]) => {
+  const key = `${RUN_ID}/${input.caseId}/${input.fileName}`;
+  storedObjects.set(`test-bucket/${key}`, {
+    body: input.body,
+    contentType: input.contentType,
+    sizeBytes: input.body.byteLength
+  });
+  return {
+    bucket: "test-bucket",
+    key,
+    sizeBytes: input.body.byteLength,
+    contentType: input.contentType
+  };
+});
 
 const storage: StorageProvider = {
   putObject,
+  async getObject(input) {
+    const stored = storedObjects.get(`${input.bucket}/${input.key}`);
+    if (!stored) {
+      throw new Error(`Missing stored object ${input.bucket}/${input.key}`);
+    }
+    return stored;
+  },
   async getSignedUrl() {
     return "http://example.test/file";
   },
@@ -265,7 +284,336 @@ describe("email invoice intake idempotency", () => {
     expect(unchanged.status).toBe("WAITING_FOR_DUE_DATE");
     expect(sent[0]?.textBody).toContain("automaticky nevykonáme");
   });
+
+  it("splits clearly separate invoice attachments into separate cases", async () => {
+    const ai = multiAttachmentAi("SEPARATE_INVOICES");
+    const service = new InvoiceIntakeService({ ai, storage });
+    const result = await service.createFromEmail({
+      organizationId,
+      email: inboundEmail({
+        providerId: `${RUN_ID}-multi-separate`,
+        subject: "Two invoices",
+        attachments: [
+          attachment("invoice-a.pdf", [11, 12, 13]),
+          attachment("invoice-b.pdf", [21, 22, 23])
+        ]
+      })
+    });
+
+    expect(result.cases).toHaveLength(2);
+    expect(ai.extractInvoice).toHaveBeenCalledTimes(2);
+    expect(result.cases.map((item) => item.status)).toEqual(["PARSED", "PARSED"]);
+    expect(
+      await prisma.case.count({
+        where: { organizationId, sourceType: "EMAIL", invoiceNumber: { startsWith: "TRIAGE-" } }
+      })
+    ).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps supporting documents on one case history", async () => {
+    const ai = multiAttachmentAi("SINGLE_INVOICE_WITH_SUPPORTING_DOCUMENTS");
+    const service = new InvoiceIntakeService({ ai, storage });
+    const result = await service.createFromEmail({
+      organizationId,
+      email: inboundEmail({
+        providerId: `${RUN_ID}-multi-supporting`,
+        subject: "Invoice with order",
+        attachments: [
+          attachment("invoice-main.pdf", [31, 32, 33]),
+          attachment("objednavka.pdf", [41, 42, 43])
+        ]
+      })
+    });
+
+    expect(result.cases).toHaveLength(1);
+    expect(ai.extractInvoice).toHaveBeenCalledTimes(1);
+    const caseId = result.cases[0]?.caseId as string;
+    expect(
+      await prisma.invoiceDocument.count({ where: { caseId } })
+    ).toBe(1);
+    expect(
+      await prisma.communicationAttachment.count({
+        where: { communication: { caseId } }
+      })
+    ).toBe(1);
+  });
+
+  it("asks for clarification when multi-attachment triage is ambiguous", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-multi-ambiguous-outbound@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const ai = multiAttachmentAi("NEEDS_CUSTOMER_CLARIFICATION");
+    const service = new InvoiceIntakeService({ ai, storage, email: emailProvider });
+    const result = await service.createFromEmail({
+      organizationId,
+      email: inboundEmail({
+        providerId: `${RUN_ID}-multi-ambiguous`,
+        subject: "Documents",
+        attachments: [
+          attachment("doklad-1.pdf", [51, 52, 53]),
+          attachment("doklad-2.pdf", [61, 62, 63])
+        ]
+      })
+    });
+    const duplicate = await service.createFromEmail({
+      organizationId,
+      email: inboundEmail({
+        providerId: `${RUN_ID}-multi-ambiguous`,
+        subject: "Documents",
+        attachments: [
+          attachment("doklad-1.pdf", [51, 52, 53]),
+          attachment("doklad-2.pdf", [61, 62, 63])
+        ]
+      })
+    });
+
+    expect(result.cases).toHaveLength(1);
+    expect(result.cases[0]?.status).toBe("MANUAL_REVIEW_REQUIRED");
+    expect(duplicate.cases[0]?.caseId).toBe(result.cases[0]?.caseId);
+    expect(ai.extractInvoice).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.textBody).toContain("viac dokumentov");
+    expect(sent[0]?.replyTo).toEqual([expect.stringMatching(/^clarify\+/)]);
+  });
+
+  it("uses customer clarification replies to split saved attachments into cases", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-multi-recovery-outbound-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const ai = stagedMultiAttachmentAi([
+      "NEEDS_CUSTOMER_CLARIFICATION",
+      "SEPARATE_INVOICES"
+    ]);
+    const service = new InvoiceIntakeService({ ai, storage, email: emailProvider });
+    const intake = await service.createFromEmail({
+      organizationId,
+      email: inboundEmail({
+        providerId: `${RUN_ID}-multi-recovery`,
+        subject: "Documents",
+        attachments: [
+          attachment("recovery-a.pdf", [71, 72, 73]),
+          attachment("recovery-b.pdf", [81, 82, 83])
+        ]
+      })
+    });
+    const caseId = intake.cases[0]?.caseId as string;
+
+    const reply = await new CustomerEmailAssistantService({
+      ai,
+      email: emailProvider,
+      storage
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-multi-recovery-reply`,
+        from: "client@example.com",
+        to: sent[0]?.replyTo ?? [],
+        subject: "Re: documents",
+        textBody: "Sú to dve samostatné faktúry: recovery-a.pdf a recovery-b.pdf.",
+        attachments: []
+      })
+    );
+
+    expect(reply).toMatchObject({
+      caseId,
+      status: "PARSED",
+      replySent: true
+    });
+    expect(ai.extractInvoice).toHaveBeenCalledTimes(2);
+    expect(
+      await prisma.case.count({
+        where: {
+          organizationId,
+          invoiceNumber: { startsWith: "RECOVERY-" }
+        }
+      })
+    ).toBe(2);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.textBody).toContain("Dokumenty sme rozdelili");
+  });
 });
+
+function inboundEmail(overrides: Partial<InboundEmail>): InboundEmail {
+  return {
+    provider: "ses",
+    providerId: `${RUN_ID}-message`,
+    messageId: null,
+    inReplyTo: null,
+    references: [],
+    autoSubmitted: null,
+    precedence: null,
+    from: "client@example.com",
+    to: ["abc-sro@fakturio.test"],
+    cc: [],
+    subject: "Invoice",
+    textBody: "Invoice attached.",
+    htmlBody: null,
+    attachments: [],
+    raw: {},
+    ...overrides
+  };
+}
+
+function attachment(fileName: string, bytes: number[]): InboundEmail["attachments"][number] {
+  return {
+    fileName,
+    mimeType: "application/pdf",
+    bytes: Uint8Array.from(bytes)
+  };
+}
+
+function multiAttachmentAi(
+  decision:
+    | "SEPARATE_INVOICES"
+    | "SINGLE_INVOICE_WITH_SUPPORTING_DOCUMENTS"
+    | "NEEDS_CUSTOMER_CLARIFICATION",
+  invoicePrefix = "TRIAGE"
+): AiProvider & {
+  extractInvoice: ReturnType<typeof vi.fn>;
+  classifyInvoiceEmailAttachments: ReturnType<typeof vi.fn>;
+} {
+  let invoiceCounter = 0;
+  const extractInvoice = vi.fn(async () => {
+    invoiceCounter += 1;
+    return {
+      invoiceNumber: `${invoicePrefix}-${invoiceCounter}`,
+      issueDate: null,
+      dueDate: "2026-07-15",
+      amountTotal: 100 + invoiceCounter,
+      currency: "EUR",
+      supplier: {
+        name: "ABC s.r.o.",
+        email: "client@example.com",
+        ico: null,
+        dic: null,
+        icDph: null,
+        address: null
+      },
+      debtor: {
+        name: `Debtor ${invoiceCounter} s.r.o.`,
+        email: `debtor-${invoiceCounter}@example.com`,
+        ico: null,
+        dic: null,
+        icDph: null,
+        address: null
+      },
+      payment: {
+        iban: null,
+        variableSymbol: null,
+        constantSymbol: null,
+        specificSymbol: null
+      },
+      subjectNote: null,
+      confidence: 0.96,
+      manualReviewRequired: false,
+      warnings: [],
+      rawResult: { invoiceCounter }
+    };
+  });
+  const classifyInvoiceEmailAttachments = vi.fn(async () => {
+    if (decision === "SEPARATE_INVOICES") {
+      return {
+        decision,
+        confidence: 0.95,
+        groups: [
+          {
+            primaryInvoiceAttachmentIndex: 0,
+            supportingAttachmentIndexes: [],
+            reason: "First document is a separate invoice."
+          },
+          {
+            primaryInvoiceAttachmentIndex: 1,
+            supportingAttachmentIndexes: [],
+            reason: "Second document is a separate invoice."
+          }
+        ],
+        customerQuestion: null,
+        warnings: []
+      };
+    }
+    if (decision === "SINGLE_INVOICE_WITH_SUPPORTING_DOCUMENTS") {
+      return {
+        decision,
+        confidence: 0.94,
+        groups: [
+          {
+            primaryInvoiceAttachmentIndex: 0,
+            supportingAttachmentIndexes: [1],
+            reason: "First document is the invoice and the second is a supporting document."
+          }
+        ],
+        customerQuestion: null,
+        warnings: []
+      };
+    }
+    return {
+      decision,
+      confidence: 0.62,
+      groups: [],
+      customerQuestion:
+        "Prosím potvrďte, ktoré dokumenty sú samostatné faktúry a ktoré sú prílohy.",
+      warnings: ["Ambiguous attachment relationship."]
+    };
+  });
+
+  return {
+    extractInvoice,
+    classifyInvoiceEmailAttachments,
+    async classifyDebtorReply() {
+      throw new Error("not used");
+    },
+    async classifyCustomerMessage() {
+      throw new Error("not used");
+    },
+    async generateDebtorEmail() {
+      throw new Error("not used");
+    },
+    async summarizeCase() {
+      throw new Error("not used");
+    }
+  };
+}
+
+function stagedMultiAttachmentAi(
+  decisions: Array<
+    | "SEPARATE_INVOICES"
+    | "SINGLE_INVOICE_WITH_SUPPORTING_DOCUMENTS"
+    | "NEEDS_CUSTOMER_CLARIFICATION"
+  >
+) {
+  let index = 0;
+  const ai = multiAttachmentAi(decisions[0] ?? "NEEDS_CUSTOMER_CLARIFICATION", "RECOVERY");
+  const classify = vi.fn(async () => {
+    const decision = decisions[Math.min(index, decisions.length - 1)] ?? "NEEDS_CUSTOMER_CLARIFICATION";
+    index += 1;
+    return multiAttachmentAi(decision, "RECOVERY").classifyInvoiceEmailAttachments(
+      {} as Parameters<AiProvider["classifyInvoiceEmailAttachments"]>[0]
+    );
+  });
+  return {
+    ...ai,
+    classifyInvoiceEmailAttachments: classify
+  };
+}
 
 function missingInvoiceAi(): AiProvider {
   return {
@@ -306,6 +654,9 @@ function missingInvoiceAi(): AiProvider {
       };
     },
     async classifyDebtorReply() {
+      throw new Error("not used");
+    },
+    async classifyInvoiceEmailAttachments() {
       throw new Error("not used");
     },
     async classifyCustomerMessage() {
@@ -354,6 +705,9 @@ function actionRequestAi(): AiProvider {
       throw new Error("not used");
     },
     async classifyDebtorReply() {
+      throw new Error("not used");
+    },
+    async classifyInvoiceEmailAttachments() {
       throw new Error("not used");
     },
     async classifyCustomerMessage() {

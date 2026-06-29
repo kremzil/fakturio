@@ -28,7 +28,9 @@ import {
   verifyCaseClarificationAddress,
   type AiProvider
 } from "@fakturio/shared";
+import { createStorageProvider, type StorageProvider } from "@fakturio/storage";
 import type { EmailOrganizationRoute } from "./email-routing";
+import { InvoiceIntakeService } from "./service";
 
 const CUSTOMER_MESSAGE_CONFIDENCE_THRESHOLD = 0.8;
 const MUTATING_INTENTS = new Set([
@@ -54,6 +56,7 @@ export type CustomerEmailAssistantResult = {
 type CustomerEmailAssistantDependencies = {
   ai: AiProvider;
   email: EmailProvider;
+  storage: StorageProvider;
 };
 
 type CustomerCandidateCase = NonNullable<CustomerMessageInput["candidateCases"]>[number];
@@ -82,7 +85,8 @@ export class CustomerEmailAssistantService {
   constructor(deps: Partial<CustomerEmailAssistantDependencies> = {}) {
     this.deps = {
       ai: deps.ai ?? createAiProvider(),
-      email: deps.email ?? createEmailProvider()
+      email: deps.email ?? createEmailProvider(),
+      storage: deps.storage ?? createStorageProvider()
     };
   }
 
@@ -147,6 +151,49 @@ export class CustomerEmailAssistantService {
     });
     if (!collectionCase) {
       return null;
+    }
+
+    const multiAttachmentClarification = await new InvoiceIntakeService({
+      ai: this.deps.ai,
+      email: this.deps.email,
+      storage: this.deps.storage
+    }).resolveMultiAttachmentClarification({
+      organizationId: collectionCase.organizationId,
+      caseId: collectionCase.id,
+      email
+    });
+    if (multiAttachmentClarification) {
+      if (!multiAttachmentClarification.stillNeedsClarification) {
+        const template = buildCustomerAssistantAcknowledgement({
+          invoiceNumber: collectionCase.invoiceNumber,
+          summary:
+            multiAttachmentClarification.caseIds.length > 1
+              ? "Dokumenty sme rozdelili a začali spracovanie jednotlivých faktúr."
+              : "Dokumenty sme priradili k jednej faktúre a začali spracovanie.",
+          stillMissing: [],
+          dashboardUrl: dashboardUrl(collectionCase.id)
+        });
+        await sendAssistantReply({
+          deps: this.deps,
+          caseId: collectionCase.id,
+          inboundCommunicationId: multiAttachmentClarification.communicationId,
+          to: email.from,
+          template,
+          idempotencyKey: `customer-multi-attachment-resolved-reply:${email.provider}:${email.providerId}`
+        });
+      }
+
+      return {
+        caseId: collectionCase.id,
+        organizationId: collectionCase.organizationId,
+        communicationId: multiAttachmentClarification.communicationId,
+        duplicate: false,
+        appliedFields: [],
+        stillMissing: [],
+        status: multiAttachmentClarification.status,
+        intent: "PROVIDE_INVOICE_FIELDS",
+        replySent: true
+      };
     }
 
     const classification = await classifyCustomerEmail({

@@ -20,8 +20,15 @@ export type GetSignedUrlInput = {
   expiresInSeconds?: number;
 };
 
+export type StoredObjectBody = {
+  body: Uint8Array;
+  contentType: string | null;
+  sizeBytes: number | null;
+};
+
 export interface StorageProvider {
   putObject(input: PutObjectInput): Promise<StoredObject>;
+  getObject(input: { bucket: string; key: string }): Promise<StoredObjectBody>;
   getSignedUrl(input: GetSignedUrlInput): Promise<string>;
   deleteObject(input: { bucket: string; key: string }): Promise<void>;
 }

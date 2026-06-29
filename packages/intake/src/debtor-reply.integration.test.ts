@@ -133,6 +133,9 @@ describe("inbound debtor reply intake", () => {
           contentType: input.contentType
         };
       },
+      async getObject() {
+        throw new Error("not used");
+      },
       async getSignedUrl() {
         return "https://example.test/attachment";
       },
@@ -180,6 +183,9 @@ describe("inbound debtor reply intake", () => {
           sizeBytes: input.body.byteLength,
           contentType: input.contentType
         };
+      },
+      async getObject() {
+        throw new Error("not used");
       },
       async getSignedUrl() {
         return "https://example.test/attachment";

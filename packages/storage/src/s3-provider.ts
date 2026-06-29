@@ -1,6 +1,12 @@
 import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { GetSignedUrlInput, PutObjectInput, StorageProvider, StoredObject, buildCaseObjectKey } from "./types";
+import {
+  GetSignedUrlInput,
+  PutObjectInput,
+  StorageProvider,
+  StoredObject,
+  buildCaseObjectKey
+} from "./types";
 
 export type S3StorageProviderOptions = {
   bucket: string;
@@ -66,6 +72,24 @@ export class S3StorageProvider implements StorageProvider {
       }),
       { expiresIn: input.expiresInSeconds ?? 900 }
     );
+  }
+
+  async getObject(input: { bucket: string; key: string }) {
+    const response = await this.client.send(
+      new GetObjectCommand({
+        Bucket: input.bucket,
+        Key: input.key
+      })
+    );
+    const body = await response.Body?.transformToByteArray();
+    if (!body) {
+      throw new Error(`Storage object ${input.bucket}/${input.key} has no body.`);
+    }
+    return {
+      body,
+      contentType: response.ContentType ?? null,
+      sizeBytes: response.ContentLength ?? null
+    };
   }
 
   async deleteObject(input: { bucket: string; key: string }): Promise<void> {
