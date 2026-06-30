@@ -97,6 +97,8 @@ describe("case confirmation link", () => {
 
     expect(response.status).toBe(200);
     expect(body).toContain("Prípad bol potvrdený");
+    expect(body).toContain("window.close()");
+    expect(body).toContain(`/?case=${caseId}`);
     const collectionCase = await prisma.case.findUniqueOrThrow({ where: { id: caseId } });
     expect(collectionCase.status).toBe("WAITING_FOR_DUE_DATE");
     expect(collectionCase.confirmedAt).not.toBeNull();

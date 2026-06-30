@@ -21,6 +21,7 @@ import {
   CASE_EVENT_TYPES,
   assertCaseTransition,
   calculateInstallmentSchedule,
+  createCaseClarificationAddress,
   createCaseReplyAddress,
   createPaymentCheckToken,
   debtorReplyClassificationSchema,
@@ -1183,11 +1184,13 @@ async function sendCustomerNotice(
   }
   const publicUrl =
     process.env.NEXTAUTH_URL || process.env.APP_URL || "http://localhost:3000";
+  const replyTo = caseClarificationAddress(caseId);
   await sendTrackedEmail({
     caseId,
     idempotencyKey,
     fromAddress: outboundFromAddress(),
     toAddress: recipient,
+    replyTo,
     template: buildCustomerExceptionNotice({
       invoiceNumber: collectionCase.invoiceNumber ?? caseId,
       title,
@@ -1195,7 +1198,7 @@ async function sendCustomerNotice(
       caseUrl: `${publicUrl}/?case=${caseId}`
     }),
     metadata: { caseId, organizationId, kind: "customer-notice" },
-    rawPayload: { kind: "customer-notice", title }
+    rawPayload: { kind: "customer-notice", title, replyTo }
   });
 }
 
@@ -1706,6 +1709,13 @@ function outboundFromAddress(): string {
 
 function caseReplyAddress(caseId: string): string {
   return createCaseReplyAddress(
+    { caseId, domain: inboundReplyDomain() },
+    requireInboundReplyTokenSecret()
+  );
+}
+
+function caseClarificationAddress(caseId: string): string {
+  return createCaseClarificationAddress(
     { caseId, domain: inboundReplyDomain() },
     requireInboundReplyTokenSecret()
   );

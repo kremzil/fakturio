@@ -96,13 +96,20 @@ export async function handleCaseConfirmLinkPost(
     );
   }
   if (result.outcome === "NOOP") {
-    return page("Prípad už bol potvrdený", "Kontrola splatnosti už bola spustená.", 200);
+    return autoClosePage({
+      title: "Prípad už bol potvrdený",
+      message: "Kontrola splatnosti už bola spustená.",
+      caseId,
+      status: 200
+    });
   }
-  return page(
-    "Prípad bol potvrdený",
-    "Kontrola splatnosti bola spustená. Ďalší krok prebehne podľa dátumu splatnosti faktúry.",
-    200
-  );
+  return autoClosePage({
+    title: "Prípad bol potvrdený",
+    message:
+      "Kontrola splatnosti bola spustená. Táto karta sa môže automaticky zatvoriť.",
+    caseId,
+    status: 200
+  });
 }
 
 function verifyToken(request: Request, caseId: string) {
@@ -147,6 +154,48 @@ function page(title: string, body: string, status: number): Response {
   return new Response(
     `<!doctype html><html lang="sk"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>${escapeHtml(title)}</title></head><body style="font-family:Inter,Arial,sans-serif;line-height:1.5;color:#1d1d1b;max-width:640px;margin:40px auto;padding:0 20px"><h1>${escapeHtml(title)}</h1>${body}</body></html>`,
     { status, headers: NO_STORE_HEADERS }
+  );
+}
+
+function autoClosePage(input: {
+  title: string;
+  message: string;
+  caseId: string;
+  status: number;
+}): Response {
+  const dashboardUrl = `/?case=${encodeURIComponent(input.caseId)}`;
+  return page(
+    input.title,
+    `
+      <p>${escapeHtml(input.message)}</p>
+      <p id="closing-note">Pokúšame sa zatvoriť túto kartu a vrátiť vás späť.</p>
+      <p id="fallback-note" style="display:none">
+        Ak prehliadač kartu nezatvoril automaticky,
+        <a href="${escapeHtml(dashboardUrl)}">otvorte prípad v aplikácii</a>.
+      </p>
+      <script>
+        (function () {
+          var fallbackUrl = ${JSON.stringify(dashboardUrl)};
+          function showFallback() {
+            var note = document.getElementById("fallback-note");
+            if (note) note.style.display = "block";
+            window.setTimeout(function () {
+              window.location.replace(fallbackUrl);
+            }, 1200);
+          }
+          window.setTimeout(function () {
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.focus();
+              }
+            } catch (_) {}
+            window.close();
+            window.setTimeout(showFallback, 700);
+          }, 250);
+        })();
+      </script>
+    `,
+    input.status
   );
 }
 
