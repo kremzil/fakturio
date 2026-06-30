@@ -5,6 +5,7 @@ import {
   verifyCaseConfirmToken
 } from "@fakturio/shared";
 import { prisma } from "@fakturio/db";
+import { formatEmailDate, formatEmailMoney } from "@fakturio/email";
 import { confirmCaseForWorkflow } from "./case-confirm";
 
 const NO_STORE_HEADERS = {
@@ -137,15 +138,18 @@ function summaryHtml(collectionCase: {
 }) {
   const amount =
     collectionCase.amountTotal !== null && collectionCase.amountTotal !== undefined
-      ? `${Number(collectionCase.amountTotal).toFixed(2)} ${collectionCase.currency ?? ""}`.trim()
+      ? formatEmailMoney(Number(collectionCase.amountTotal), collectionCase.currency)
       : "nezadaná";
+  const dueDate = collectionCase.dueDate
+    ? formatEmailDate(collectionCase.dueDate)
+    : "nezadaná";
   return `
     <dl style="display:grid;grid-template-columns:max-content 1fr;gap:8px 18px;margin:18px 0">
       <dt>Stav</dt><dd>${escapeHtml(collectionCase.status)}</dd>
       <dt>Faktúra</dt><dd>${escapeHtml(collectionCase.invoiceNumber ?? "nezadaná")}</dd>
       <dt>Dlžník</dt><dd>${escapeHtml(collectionCase.debtor?.name ?? "nezadaný")}</dd>
       <dt>Suma</dt><dd>${escapeHtml(amount)}</dd>
-      <dt>Splatnosť</dt><dd>${escapeHtml(collectionCase.dueDate?.toISOString().slice(0, 10) ?? "nezadaná")}</dd>
+      <dt>Splatnosť</dt><dd>${escapeHtml(dueDate)}</dd>
     </dl>
   `;
 }
@@ -170,7 +174,7 @@ function autoClosePage(input: {
       <p>${escapeHtml(input.message)}</p>
       <p id="closing-note">Pokúšame sa zatvoriť túto kartu a vrátiť vás späť.</p>
       <p id="fallback-note" style="display:none">
-        Ak prehliadač kartu nezatvoril automaticky,
+        Prehliadač túto kartu nezatvoril automaticky. Ak máte prístup do dashboardu,
         <a href="${escapeHtml(dashboardUrl)}">otvorte prípad v aplikácii</a>.
       </p>
       <script>

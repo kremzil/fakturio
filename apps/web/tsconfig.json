@@ -2,6 +2,7 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "allowJs": false,
+    "ignoreDeprecations": "5.0",
     "baseUrl": ".",
     "incremental": true,
     "noEmit": true,

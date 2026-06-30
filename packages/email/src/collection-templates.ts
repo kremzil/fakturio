@@ -1,3 +1,5 @@
+import { escapeHtml, formatEmailDate, formatEmailMoney, renderEmailDocument } from "./format";
+
 export type InstallmentScheduleRow = {
   sequence: number;
   amount: number;
@@ -104,7 +106,7 @@ export function buildInstallmentProposal(input: {
 }): CollectionTemplate {
   const rows = input.payments.map(
     (payment) =>
-      `${payment.sequence}. splátka: ${payment.amount.toFixed(2)} ${input.currency}, splatná ${payment.dueDate}`
+      `${payment.sequence}. splátka: ${formatEmailMoney(payment.amount, input.currency)}, splatná ${formatEmailDate(payment.dueDate)}`
   );
   return template(
     `Návrh splátkového kalendára k faktúre ${input.invoiceNumber}`,
@@ -134,7 +136,7 @@ export function buildInstallmentActivated(input: {
       "Vaše výslovné prijatie splátkového kalendára sme zaevidovali.",
       ...input.payments.map(
         (payment) =>
-          `${payment.sequence}. splátka: ${payment.amount.toFixed(2)} ${input.currency}, splatná ${payment.dueDate}`
+          `${payment.sequence}. splátka: ${formatEmailMoney(payment.amount, input.currency)}, splatná ${formatEmailDate(payment.dueDate)}`
       ),
       "",
       "Dodržanie jednotlivých termínov budeme priebežne overovať.",
@@ -155,7 +157,7 @@ export function buildSecondReminder(input: {
     [
       "Dobrý deň,",
       "",
-      `napriek predchádzajúcej upomienke eviduje ${input.creditorName} faktúru ${input.invoiceNumber} vo výške ${input.amountTotal.toFixed(2)} ${input.currency} ako neuhradenú.`,
+      `napriek predchádzajúcej upomienke eviduje ${input.creditorName} faktúru ${input.invoiceNumber} vo výške ${formatEmailMoney(input.amountTotal, input.currency)} ako neuhradenú.`,
       "Žiadame Vás o bezodkladnú úhradu alebo okamžité kontaktovanie FAKTURIO či veriteľa s konkrétnym návrhom riešenia.",
       "Ak sa vec nevyrieši, veriteľ môže zvážiť ďalšie kroky na vymáhanie pohľadávky vrátane súdneho uplatnenia.",
       "",
@@ -176,9 +178,9 @@ export function buildInstallmentBrokenNotice(input: {
     [
       "Dobrý deň,",
       "",
-      `veriteľ nepotvrdil prijatie ${input.missedSequence}. splátky vo výške ${input.missedAmount.toFixed(2)} ${input.currency}.`,
+      `veriteľ nepotvrdil prijatie ${input.missedSequence}. splátky vo výške ${formatEmailMoney(input.missedAmount, input.currency)}.`,
       "Splátkový kalendár preto evidujeme ako porušený.",
-      `Prosíme o bezodkladné kontaktovanie FAKTURIO alebo veriteľa a vyriešenie zostávajúcej sumy ${input.remainingAmount.toFixed(2)} ${input.currency}.`,
+      `Prosíme o bezodkladné kontaktovanie FAKTURIO alebo veriteľa a vyriešenie zostávajúcej sumy ${formatEmailMoney(input.remainingAmount, input.currency)}.`,
       "",
       "Ďakujeme."
     ]
@@ -401,8 +403,9 @@ export function buildCustomerCaseStatusReply(input: {
   const reference = input.invoiceNumber || "prípadu";
   const amount =
     input.amountTotal !== null
-      ? `${input.amountTotal.toFixed(2)} ${input.currency || ""}`.trim()
+      ? formatEmailMoney(input.amountTotal, input.currency)
       : "nezadaná";
+  const dueDate = input.dueDate ? formatEmailDate(input.dueDate) : "nezadaná";
   return template(
     `FAKTURIO: stav ${reference}`,
     [
@@ -412,7 +415,7 @@ export function buildCustomerCaseStatusReply(input: {
       `Faktúra: ${input.invoiceNumber || "nezadaná"}`,
       `Dlžník: ${input.debtorName || "nezadaný"}`,
       `Suma: ${amount}`,
-      `Splatnosť: ${input.dueDate || "nezadaná"}`,
+      `Splatnosť: ${dueDate}`,
       input.confirmUrl
         ? `Ak sú údaje správne, potvrďte spustenie kontroly tu: ${input.confirmUrl}`
         : "",
@@ -425,17 +428,10 @@ export function buildCustomerCaseStatusReply(input: {
 
 function template(subject: string, lines: string[]): CollectionTemplate {
   const textBody = lines.join("\n");
-  const htmlBody = lines
+  const bodyHtml = lines
     .map((line) => (line ? `<p>${escapeHtml(line)}</p>` : "<br />"))
     .join("");
+  const preheader = lines.find((line) => line.trim().length > 0) ?? subject;
+  const htmlBody = renderEmailDocument({ title: subject, preheader, bodyHtml });
   return { subject, textBody, htmlBody };
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

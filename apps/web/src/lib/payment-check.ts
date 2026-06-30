@@ -8,6 +8,7 @@ import {
   WORKFLOW_COMMAND_TYPES
 } from "@fakturio/shared";
 import { prisma } from "@fakturio/db";
+import { formatEmailDate, formatEmailMoney } from "@fakturio/email";
 import type { Prisma } from "@prisma/client";
 
 const NO_STORE_HEADERS = {
@@ -584,20 +585,23 @@ async function loadLegacyCase(caseId: string, organizationId: string) {
 
 function legacySummaryHtml(collectionCase: LegacyCase): string {
   const amount = collectionCase.amountTotal
-    ? `${Number(collectionCase.amountTotal).toFixed(2)} ${collectionCase.currency ?? ""}`.trim()
+    ? formatEmailMoney(Number(collectionCase.amountTotal), collectionCase.currency)
     : "nezistená suma";
+  const dueDate = collectionCase.dueDate
+    ? formatEmailDate(collectionCase.dueDate)
+    : "—";
   return `
     <table style="border-collapse:collapse;margin:16px 0">
       <tr><td style="padding:2px 12px 2px 0;color:#666">Faktúra</td><td>${escapeHtml(collectionCase.invoiceNumber ?? "—")}</td></tr>
       <tr><td style="padding:2px 12px 2px 0;color:#666">Dlžník</td><td>${escapeHtml(collectionCase.debtor?.name ?? "—")}</td></tr>
       <tr><td style="padding:2px 12px 2px 0;color:#666">Suma</td><td>${escapeHtml(amount)}</td></tr>
-      <tr><td style="padding:2px 12px 2px 0;color:#666">Splatnosť</td><td>${escapeHtml(collectionCase.dueDate?.toISOString().slice(0, 10) ?? "—")}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Splatnosť</td><td>${escapeHtml(dueDate)}</td></tr>
     </table>`;
 }
 
 function summaryHtml(paymentCheck: LoadedPaymentCheck): string {
   const amount = paymentCheck.expectedAmount
-    ? `${Number(paymentCheck.expectedAmount).toFixed(2)} ${paymentCheck.currency ?? ""}`.trim()
+    ? formatEmailMoney(Number(paymentCheck.expectedAmount), paymentCheck.currency)
     : "nezistená suma";
   const label = paymentCheck.installmentPayment
     ? `${paymentCheck.installmentPayment.sequence}. splátka`
@@ -605,12 +609,13 @@ function summaryHtml(paymentCheck: LoadedPaymentCheck): string {
   const dueDate =
     paymentCheck.installmentPayment?.dueDate ??
     paymentCheck.case.dueDate;
+  const formattedDueDate = dueDate ? formatEmailDate(dueDate) : "—";
   return `
     <table style="border-collapse:collapse;margin:16px 0">
       <tr><td style="padding:2px 12px 2px 0;color:#666">Platba</td><td>${escapeHtml(label)}</td></tr>
       <tr><td style="padding:2px 12px 2px 0;color:#666">Dlžník</td><td>${escapeHtml(paymentCheck.case.debtor?.name ?? "—")}</td></tr>
       <tr><td style="padding:2px 12px 2px 0;color:#666">Suma</td><td>${escapeHtml(amount)}</td></tr>
-      <tr><td style="padding:2px 12px 2px 0;color:#666">Termín</td><td>${escapeHtml(dueDate?.toISOString().slice(0, 10) ?? "—")}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666">Termín</td><td>${escapeHtml(formattedDueDate)}</td></tr>
     </table>`;
 }
 

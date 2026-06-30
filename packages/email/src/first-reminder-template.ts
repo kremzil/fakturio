@@ -1,3 +1,5 @@
+import { escapeHtml, formatEmailDate, formatEmailMoney, renderEmailDocument } from "./format";
+
 export type FirstReminderTemplateInput = {
   debtorName: string;
   creditorName: string;
@@ -22,7 +24,9 @@ export type EmailTemplate = {
 export function buildFirstReminderEmail(
   input: FirstReminderTemplateInput
 ): EmailTemplate {
-  const amount = `${input.amountTotal.toFixed(2)} ${input.currency}`;
+  const amount = formatEmailMoney(input.amountTotal, input.currency);
+  const originalDueDate = formatEmailDate(input.originalDueDate);
+  const requestedPaymentDate = formatEmailDate(input.requestedPaymentDate);
   const paymentRows = [
     input.iban ? `IBAN: ${input.iban}` : null,
     input.variableSymbol
@@ -40,12 +44,12 @@ export function buildFirstReminderEmail(
     "",
     `v mene spoločnosti ${input.creditorName} si Vás dovoľujeme upozorniť, že evidujeme neuhradenú faktúru ${input.invoiceNumber}.`,
     `Suma na úhradu: ${amount}`,
-    `Pôvodný dátum splatnosti: ${input.originalDueDate}`,
+    `Pôvodný dátum splatnosti: ${originalDueDate}`,
     ...creditorRows,
     ...(input.subjectNote ? [`Predmet faktúry: ${input.subjectNote}`] : []),
     ...paymentRows,
     "",
-    `Prosíme o úhradu najneskôr do ${input.requestedPaymentDate}.`,
+    `Prosíme o úhradu najneskôr do ${requestedPaymentDate}.`,
     "Ak ste už faktúru uhradili, odpovedzte na tento email s informáciou o platbe.",
     "",
     "Ďakujeme."
@@ -55,8 +59,8 @@ export function buildFirstReminderEmail(
     ["Veriteľ", input.creditorName],
     ["Faktúra", input.invoiceNumber],
     ["Suma na úhradu", amount],
-    ["Pôvodná splatnosť", input.originalDueDate],
-    ["Nový termín úhrady", input.requestedPaymentDate],
+    ["Pôvodná splatnosť", originalDueDate],
+    ["Nový termín úhrady", requestedPaymentDate],
     ...(input.creditorAddress
       ? [["Adresa veriteľa", input.creditorAddress] as const]
       : []),
@@ -72,7 +76,7 @@ export function buildFirstReminderEmail(
       : [])
   ];
 
-  const htmlBody = [
+  const bodyHtml = [
     `<p>Dobrý deň, ${escapeHtml(input.debtorName)},</p>`,
     `<p>v mene spoločnosti <strong>${escapeHtml(input.creditorName)}</strong> si Vás dovoľujeme upozorniť, že evidujeme neuhradenú faktúru.</p>`,
     `<table style="border-collapse:collapse;margin:16px 0">${detailRows
@@ -81,19 +85,15 @@ export function buildFirstReminderEmail(
           `<tr><td style="padding:3px 16px 3px 0;color:#666">${escapeHtml(label)}</td><td style="padding:3px 0"><strong>${escapeHtml(value)}</strong></td></tr>`
       )
       .join("")}</table>`,
-    `<p>Prosíme o úhradu najneskôr do <strong>${escapeHtml(input.requestedPaymentDate)}</strong>.</p>`,
+    `<p>Prosíme o úhradu najneskôr do <strong>${escapeHtml(requestedPaymentDate)}</strong>.</p>`,
     "<p>Ak ste už faktúru uhradili, odpovedzte na tento email s informáciou o platbe.</p>",
     "<p>Ďakujeme.</p>"
   ].join("");
+  const htmlBody = renderEmailDocument({
+    title: subject,
+    preheader: `Pripomienka úhrady faktúry ${input.invoiceNumber} vo výške ${amount}.`,
+    bodyHtml
+  });
 
   return { subject, textBody, htmlBody };
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

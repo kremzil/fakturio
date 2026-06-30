@@ -1,4 +1,6 @@
 export * from "./types";
+export * from "./errors";
+export * from "./format";
 export * from "./ses-provider";
 export * from "./mime";
 export * from "./first-reminder-template";

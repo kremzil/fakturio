@@ -19,10 +19,12 @@ describe("first debtor reminder template", () => {
     });
 
     expect(email.subject).toContain("FV-2026-10");
-    expect(email.textBody).toContain("480.00 EUR");
+    expect(email.textBody).toContain("480,00 €");
     expect(email.textBody).toContain("Veriteľ s.r.o.");
-    expect(email.textBody).toContain("2026-06-20");
+    expect(email.textBody).toContain("20. 6. 2026");
     expect(email.textBody).toContain("SK1211000000002941987654");
+    expect(email.htmlBody).toContain("<!doctype html>");
+    expect(email.htmlBody).toContain("max-width:640px");
     expect(email.htmlBody).toContain("Variabilný symbol");
   });
 

@@ -15,6 +15,7 @@ import {
   buildPaymentClaimAcknowledgement,
   buildSecondReminder,
   createEmailProvider,
+  isPermanentEmailProviderError,
   type CollectionTemplate
 } from "@fakturio/email";
 import {
@@ -377,7 +378,7 @@ export const activities: CaseWorkflowActivities = {
         }
       });
     } catch (error) {
-      if (!isPermanentEmailRejection(error)) {
+      if (!isPermanentEmailProviderError(error)) {
         throw error;
       }
       await pauseForMissingContact(
@@ -1485,27 +1486,6 @@ async function markCommunicationSendFailed(
       }
     })
     .catch(() => undefined);
-}
-
-function isPermanentEmailRejection(error: unknown): boolean {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const record = error as { name?: unknown; message?: unknown; Code?: unknown; code?: unknown };
-  const code =
-    typeof record.name === "string"
-      ? record.name
-      : typeof record.Code === "string"
-        ? record.Code
-        : typeof record.code === "string"
-          ? record.code
-          : "";
-  const message = typeof record.message === "string" ? record.message : "";
-  return (
-    code === "MessageRejected" ||
-    (code === "BadRequestException" &&
-      /not verified|identity|recipient|address/i.test(message))
-  );
 }
 
 async function loadCaseForCollection(caseId: string, organizationId: string) {

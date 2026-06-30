@@ -97,6 +97,60 @@ describe("SES inbound S3 poller", () => {
     });
   });
 
+  it("leaves transient processing errors pending for retry", async () => {
+    const store = objectStore([
+      {
+        key: "inbound/message-3",
+        bytes: mimeBytes("reply+case@example.com")
+      }
+    ]);
+
+    const results = await processSesInboundS3Batch({
+      config: baseConfig,
+      store,
+      processEmail: async () => {
+        throw new Error("Temporary AI timeout");
+      },
+      logger: silentLogger()
+    });
+
+    expect(results).toMatchObject([
+      {
+        key: "inbound/message-3",
+        destinationKey: "inbound/message-3",
+        outcome: "RETRYABLE_ERROR",
+        error: "Temporary AI timeout"
+      }
+    ]);
+    expect(store.moveObject).not.toHaveBeenCalled();
+  });
+
+  it("leaves transient S3 read errors pending for retry", async () => {
+    const store = objectStore([
+      {
+        key: "inbound/message-4",
+        bytes: mimeBytes("reply+case@example.com")
+      }
+    ]);
+    store.readObject.mockRejectedValueOnce(new Error("S3 timeout"));
+
+    const results = await processSesInboundS3Batch({
+      config: baseConfig,
+      store,
+      logger: silentLogger()
+    });
+
+    expect(results).toMatchObject([
+      {
+        key: "inbound/message-4",
+        destinationKey: "inbound/message-4",
+        outcome: "RETRYABLE_ERROR",
+        error: "S3 timeout"
+      }
+    ]);
+    expect(store.moveObject).not.toHaveBeenCalled();
+  });
+
   it("skips the SES setup notification object", async () => {
     const store = objectStore([
       {

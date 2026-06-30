@@ -46,7 +46,7 @@ export type SesInboundObjectStore = {
 export type SesInboundProcessResult = {
   key: string;
   destinationKey: string;
-  outcome: "PROCESSED" | "FAILED";
+  outcome: "PROCESSED" | "FAILED" | "RETRYABLE_ERROR";
   processing: InboundEmailProcessingResult | null;
   error: string | null;
 };
@@ -193,6 +193,10 @@ export async function processSesInboundS3Batch(input: {
       logger.warn(
         `SES inbound object ${object.key} moved to ${result.destinationKey}: ${result.error}`
       );
+    } else if (result.outcome === "RETRYABLE_ERROR") {
+      logger.warn(
+        `SES inbound object ${object.key} left pending for retry: ${result.error}`
+      );
     } else {
       logger.log(
         `SES inbound object ${object.key} processed as ${result.processing?.kind}.`
@@ -253,19 +257,10 @@ export async function processSesInboundS3Object(input: {
       error: null
     };
   } catch (error) {
-    const destinationKey = destinationObjectKey(
-      input.config,
-      input.object.key,
-      input.config.failedPrefix
-    );
-    await input.store.moveObject({
-      sourceKey: input.object.key,
-      destinationKey
-    });
     return {
       key: input.object.key,
-      destinationKey,
-      outcome: "FAILED",
+      destinationKey: input.object.key,
+      outcome: "RETRYABLE_ERROR",
       processing: null,
       error: error instanceof Error ? error.message : "Unknown SES inbound processing error."
     };

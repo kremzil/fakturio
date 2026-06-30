@@ -120,6 +120,18 @@ type NavView =
   | "ARCHIVE";
 type DebtorFilterId = "ALL" | "ACTIVE" | "WITHOUT_EMAIL";
 type DetailTab = "OVERVIEW" | "TIMELINE" | "COMMUNICATIONS";
+type ToastKind = "success" | "error" | "info";
+type ToastMessage = {
+  id: number;
+  kind: ToastKind;
+  text: string;
+};
+type ConfirmDialogState = {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+};
 type ReviewFormState = {
   invoiceNumber: string;
   supplierName: string;
@@ -131,13 +143,16 @@ type ReviewFormState = {
   iban: string;
   variableSymbol: string;
 };
+type ReviewFieldErrors = Partial<Record<keyof ReviewFormState, string>>;
 
 export function Dashboard({
   initialCases,
-  initialDebtors
+  initialDebtors,
+  organizationName
 }: {
   initialCases: DashboardCase[];
   initialDebtors: DashboardDebtor[];
+  organizationName: string;
 }) {
   const [cases, setCases] = useState(initialCases);
   const [debtors, setDebtors] = useState(initialDebtors);
@@ -164,7 +179,10 @@ export function Dashboard({
   const [isSaving, setSaving] = useState(false);
   const [isConfirming, setConfirming] = useState(false);
   const [isActionPending, startActionTransition] = useTransition();
-  const [message, setMessage] = useState<string | null>(null);
+  const [toast, setToast] = useState<ToastMessage | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(
+    null
+  );
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
 
   const filteredCases = useMemo(
@@ -210,6 +228,14 @@ export function Dashboard({
   }, [reviewDirty]);
 
   useEffect(() => {
+    if (!toast) {
+      return;
+    }
+    const timeout = window.setTimeout(() => setToast(null), 5200);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
+
+  useEffect(() => {
     if (
       navView === "DEBTORS" &&
       selectedDebtor &&
@@ -223,23 +249,25 @@ export function Dashboard({
   async function uploadInvoice(formData: FormData) {
     const file = formData.get("file");
     if (!(file instanceof File) || file.size === 0) {
-      setMessage("Vyberte PDF alebo obrázok faktúry.");
+      notify("error", "Vyberte PDF alebo obrázok faktúry.");
       return;
     }
     setUploading(true);
-    setMessage(null);
+    clearToast();
     try {
       const response = await fetch("/api/cases/upload", {
         method: "POST",
         body: formData
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Nahratie zlyhalo.");
+        notify("error", payload.error ?? "Nahratie zlyhalo.");
         return;
       }
       replaceCase(payload.case, true);
-      setMessage("Faktúra bola načítaná do nového prípadu.");
+      notify("success", "Faktúra bola načítaná do nového prípadu.");
+    } catch {
+      notify("error", "Nahratie zlyhalo. Skontrolujte pripojenie a skúste to znova.");
     } finally {
       setUploading(false);
     }
@@ -257,17 +285,20 @@ export function Dashboard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(toDraftPayload(reviewForm))
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Uloženie zlyhalo.");
+        notify("error", payload.error ?? "Uloženie zlyhalo.");
         return false;
       }
       replaceCase(payload.case);
       setReviewDirty(false);
       if (showMessage) {
-        setMessage("Zmeny boli uložené.");
+        notify("success", "Zmeny boli uložené.");
       }
       return true;
+    } catch {
+      notify("error", "Uloženie zlyhalo. Skontrolujte pripojenie a skúste to znova.");
+      return false;
     } finally {
       setSaving(false);
     }
@@ -278,21 +309,24 @@ export function Dashboard({
       return;
     }
     setConfirming(true);
-    setMessage(null);
+    clearToast();
     setValidationErrors([]);
     try {
       const response = await fetch(`/api/cases/${selected.id}/confirm`, {
         method: "POST"
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (response.ok) {
         replaceCase(payload.case);
-        setMessage("Faktúra bola potvrdená a workflow je aktívny.");
+        notify("success", "Faktúra bola potvrdená a workflow je aktívny.");
       } else {
+        notify("error", payload.error ?? "Potvrdenie zlyhalo.");
         setValidationErrors(
           payload.errors ?? [payload.error ?? "Potvrdenie zlyhalo."]
         );
       }
+    } catch {
+      notify("error", "Potvrdenie zlyhalo. Skontrolujte pripojenie a skúste to znova.");
     } finally {
       setConfirming(false);
     }
@@ -309,24 +343,37 @@ export function Dashboard({
       return;
     }
     startActionTransition(async () => {
-      setMessage(null);
-      const response =
-        action === "MARK_PAID"
-          ? await fetch(`/api/cases/${selected.id}/mark-paid`, {
-              method: "POST"
-            })
-          : await fetch(`/api/cases/${selected.id}/actions`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action })
-            });
-      const payload = await response.json();
-      if (!response.ok) {
-        setMessage(payload.error ?? "Akciu sa nepodarilo vykonať.");
-        return;
+      clearToast();
+      try {
+        const response =
+          action === "MARK_PAID"
+            ? await fetch(`/api/cases/${selected.id}/mark-paid`, {
+                method: "POST"
+              })
+            : await fetch(`/api/cases/${selected.id}/actions`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action })
+              });
+        const payload = await readApiPayload(response);
+        if (!response.ok) {
+          notify("error", payload.error ?? "Akciu sa nepodarilo vykonať.");
+          return;
+        }
+        replaceCase(payload.case);
+        notify("success", actionMessage(action) ?? "Akcia bola vykonaná.");
+      } catch {
+        notify("error", "Akciu sa nepodarilo vykonať. Skontrolujte pripojenie a skúste to znova.");
       }
-      replaceCase(payload.case);
-      setMessage(actionMessage(action) ?? "Akcia bola vykonaná.");
+    });
+  }
+
+  function requestCaseCancel() {
+    setConfirmDialog({
+      title: "Zastaviť prípad?",
+      body: "Automatizácia sa ukončí a prípad sa označí ako zastavený. Túto akciu použite iba vtedy, keď už nechcete pokračovať vo vymáhaní.",
+      confirmLabel: "Zastaviť prípad",
+      onConfirm: () => runCaseAction("CANCEL_CASE")
     });
   }
 
@@ -359,12 +406,14 @@ export function Dashboard({
     setDetailLoadingId(caseId);
     try {
       const response = await fetch(`/api/cases/${caseId}`);
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Detail prípadu sa nepodarilo načítať.");
+        notify("error", payload.error ?? "Detail prípadu sa nepodarilo načítať.");
         return;
       }
       replaceCase(payload.case);
+    } catch {
+      notify("error", "Detail prípadu sa nepodarilo načítať. Skontrolujte pripojenie.");
     } finally {
       setDetailLoadingId(null);
     }
@@ -374,15 +423,17 @@ export function Dashboard({
     setDebtorLoadingId(debtorId);
     try {
       const response = await fetch(`/api/debtors/${debtorId}`);
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Históriu dlžníka sa nepodarilo načítať.");
+        notify("error", payload.error ?? "Históriu dlžníka sa nepodarilo načítať.");
         return;
       }
       setDebtorDetails((current) => ({
         ...current,
         [debtorId]: payload.debtor
       }));
+    } catch {
+      notify("error", "Históriu dlžníka sa nepodarilo načítať. Skontrolujte pripojenie.");
     } finally {
       setDebtorLoadingId((current) => (current === debtorId ? null : current));
     }
@@ -391,9 +442,9 @@ export function Dashboard({
   async function refreshDebtors() {
     try {
       const response = await fetch("/api/debtors");
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Zoznam dlžníkov sa nepodarilo obnoviť.");
+        notify("error", payload.error ?? "Zoznam dlžníkov sa nepodarilo obnoviť.");
         return;
       }
       const refreshed: DashboardDebtor[] = payload.debtors;
@@ -405,7 +456,7 @@ export function Dashboard({
           : refreshed[0]?.id ?? null
       );
     } catch {
-      setMessage("Zoznam dlžníkov sa nepodarilo obnoviť.");
+      notify("error", "Zoznam dlžníkov sa nepodarilo obnoviť.");
     }
   }
 
@@ -430,19 +481,24 @@ export function Dashboard({
     setDetailLoadingId(item.id);
     try {
       const response = await fetch(`/api/cases/${item.id}`);
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Detail prípadu sa nepodarilo načítať.");
+        notify("error", payload.error ?? "Detail prípadu sa nepodarilo načítať.");
         return;
       }
       replaceCase(payload.case);
+    } catch {
+      notify("error", "Detail prípadu sa nepodarilo načítať. Skontrolujte pripojenie.");
     } finally {
       setDetailLoadingId(null);
     }
   }
 
   function updateReviewField(field: keyof ReviewFormState, value: string) {
-    setReviewForm((current) => ({ ...current, [field]: value }));
+    setReviewForm((current) => ({
+      ...current,
+      [field]: field === "currency" ? value.toUpperCase().slice(0, 3) : value
+    }));
     setReviewDirty(true);
   }
 
@@ -487,31 +543,47 @@ export function Dashboard({
       return;
     }
     setContactSaving(true);
-    setMessage(null);
+    clearToast();
     try {
       const response = await fetch(`/api/cases/${selected.id}/contact`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ debtorEmail: contactEmail })
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        setMessage(payload.error ?? "Kontakt sa nepodarilo uložiť.");
+        notify("error", payload.error ?? "Kontakt sa nepodarilo uložiť.");
         return;
       }
       replaceCase(payload.case);
-      setMessage("Email dlžníka bol uložený. Teraz môžete obnoviť workflow.");
+      notify("success", "Email dlžníka bol uložený. Teraz môžete obnoviť workflow.");
+    } catch {
+      notify("error", "Kontakt sa nepodarilo uložiť. Skontrolujte pripojenie a skúste to znova.");
     } finally {
       setContactSaving(false);
     }
   }
 
+  function notify(kind: ToastKind, text: string) {
+    setToast({ id: Date.now(), kind, text });
+  }
+
+  function clearToast() {
+    setToast(null);
+  }
+
   return (
     <main className="min-h-screen bg-[#edf0ed] text-ink">
+      <ToastNotice toast={toast} onDismiss={clearToast} />
+      <ConfirmDialog
+        dialog={confirmDialog}
+        onClose={() => setConfirmDialog(null)}
+      />
       <div className="min-h-screen xl:grid xl:grid-cols-[196px_430px_minmax(0,1fr)]">
         <Sidebar
           counts={counts}
           debtorCount={debtors.length}
+          organizationName={organizationName}
           activeView={navView}
           onNavigate={navigateDashboard}
         />
@@ -600,12 +672,6 @@ export function Dashboard({
             )}
           </div>
 
-          {message ? (
-            <div className="border-b border-zincLine bg-ledger/45 px-5 py-3 text-sm">
-              {message}
-            </div>
-          ) : null}
-
           <div className="max-h-[640px] overflow-y-auto xl:max-h-[calc(100vh-230px)]">
             {navView === "DEBTORS" && filteredDebtors.length ? (
               filteredDebtors.map((item) => (
@@ -664,6 +730,7 @@ export function Dashboard({
                 item={selected}
                 pending={isActionPending}
                 onAction={runCaseAction}
+                onCancel={requestCaseCancel}
                 onBack={closeMobileDetail}
               />
               <DetailTabs
@@ -671,11 +738,6 @@ export function Dashboard({
                 onChange={setDetailTab}
                 item={selected}
               />
-              {message ? (
-                <div className="border-b border-zincLine bg-ledger/45 px-5 py-3 text-sm xl:hidden">
-                  {message}
-                </div>
-              ) : null}
               {detailLoadingId === selected.id ? (
                 <div className="border-b border-zincLine px-5 py-3 text-sm text-steel">
                   Načítavam úplnú históriu prípadu…
@@ -720,11 +782,13 @@ export function Dashboard({
 function Sidebar({
   counts,
   debtorCount,
+  organizationName,
   activeView,
   onNavigate
 }: {
   counts: ReturnType<typeof summarizeCases>;
   debtorCount: number;
+  organizationName: string;
   activeView: NavView;
   onNavigate: (view: NavView) => void;
 }) {
@@ -843,7 +907,7 @@ function Sidebar({
                 setMobileMenuOpen(false);
               }}
             />
-            <AccountSummary />
+            <AccountSummary organizationName={organizationName} counts={counts} />
           </aside>
         </div>
       ) : null}
@@ -858,7 +922,7 @@ function Sidebar({
           activeView={activeView}
           onSelect={onNavigate}
         />
-        <AccountSummary />
+        <AccountSummary organizationName={organizationName} counts={counts} />
       </aside>
     </>
   );
@@ -926,14 +990,116 @@ function Navigation({
   );
 }
 
-function AccountSummary() {
+function AccountSummary({
+  organizationName,
+  counts
+}: {
+  organizationName: string;
+  counts: ReturnType<typeof summarizeCases>;
+}) {
+  const status =
+    counts.attention > 0
+      ? `${counts.attention} vyžaduje zásah`
+      : `${counts.open} ${slovakOpenCaseLabel(counts.open)} prípadov`;
   return (
     <div className="border-t border-white/15 p-4">
       <div className="text-xs text-white/55">Aktívny účet</div>
-      <div className="mt-1 text-sm font-medium">Lokálna organizácia</div>
+      <div className="mt-1 truncate text-sm font-medium">{organizationName}</div>
       <div className="mt-4 flex items-center gap-2 text-xs text-white/65">
-        <CheckCircle2 className="h-4 w-4 text-ledger" />
-        Systémy pripravené
+        <CheckCircle2
+          className={`h-4 w-4 ${counts.attention > 0 ? "text-[#e2bd78]" : "text-ledger"}`}
+        />
+        {status}
+      </div>
+    </div>
+  );
+}
+
+function ToastNotice({
+  toast,
+  onDismiss
+}: {
+  toast: ToastMessage | null;
+  onDismiss: () => void;
+}) {
+  if (!toast) {
+    return null;
+  }
+  const tone =
+    toast.kind === "success"
+      ? "border-[#75a45c] bg-[#f1f8ee] text-[#244d18]"
+      : toast.kind === "error"
+        ? "border-[#d29a62] bg-[#fff7ed] text-[#7a321d]"
+        : "border-zincLine bg-white text-ink";
+  const Icon = toast.kind === "success" ? CheckCircle2 : AlertTriangle;
+  return (
+    <div
+      key={toast.id}
+      role={toast.kind === "error" ? "alert" : "status"}
+      aria-live={toast.kind === "error" ? "assertive" : "polite"}
+      className={`fixed right-4 top-4 z-50 flex max-w-[calc(100vw-2rem)] items-start gap-3 border px-4 py-3 text-sm shadow-sm sm:max-w-md ${tone}`}
+    >
+      <Icon className="mt-0.5 h-4 w-4 shrink-0" />
+      <div className="min-w-0 flex-1">{toast.text}</div>
+      <button
+        type="button"
+        aria-label="Zavrieť oznámenie"
+        onClick={onDismiss}
+        className="ml-2 text-current opacity-70 hover:opacity-100"
+      >
+        <X className="h-4 w-4" />
+      </button>
+    </div>
+  );
+}
+
+function ConfirmDialog({
+  dialog,
+  onClose
+}: {
+  dialog: ConfirmDialogState | null;
+  onClose: () => void;
+}) {
+  if (!dialog) {
+    return null;
+  }
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
+    >
+      <div className="w-full max-w-md border border-zincLine bg-white p-5 shadow-xl">
+        <div className="flex items-start gap-3">
+          <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-warn" />
+          <div>
+            <h2 id="confirm-dialog-title" className="text-lg font-semibold">
+              {dialog.title}
+            </h2>
+            <p className="mt-2 text-sm text-steel">{dialog.body}</p>
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="h-10 border border-zincLine px-4 text-sm hover:border-ink"
+          >
+            Späť
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const onConfirm = dialog.onConfirm;
+              onClose();
+              onConfirm();
+            }}
+            className="h-10 bg-[#9c3e25] px-4 text-sm text-white hover:bg-[#84331f]"
+          >
+            {dialog.confirmLabel}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1277,6 +1443,7 @@ function CaseHeader({
   item,
   pending,
   onAction,
+  onCancel,
   onBack
 }: {
   item: DashboardCase;
@@ -1288,6 +1455,7 @@ function CaseHeader({
       | "RESUME_AUTOMATION"
       | "CANCEL_CASE"
   ) => void;
+  onCancel: () => void;
   onBack: () => void;
 }) {
   const terminal = TERMINAL_STATUSES.has(item.status);
@@ -1348,11 +1516,7 @@ function CaseHeader({
               title="Zastaviť prípad"
               aria-label="Zastaviť prípad"
               disabled={pending}
-              onClick={() => {
-                if (window.confirm("Naozaj chcete zastaviť tento prípad?")) {
-                  onAction("CANCEL_CASE");
-                }
-              }}
+              onClick={onCancel}
               className="flex h-9 w-9 items-center justify-center border border-zincLine hover:border-warn hover:text-warn disabled:opacity-50"
             >
               <MoreHorizontal className="h-4 w-4" />
@@ -1366,11 +1530,7 @@ function CaseHeader({
             title="Zastaviť prípad"
             aria-label="Zastaviť prípad"
             disabled={pending}
-            onClick={() => {
-              if (window.confirm("Naozaj chcete zastaviť tento prípad?")) {
-                onAction("CANCEL_CASE");
-              }
-            }}
+            onClick={onCancel}
             className="flex h-9 w-9 items-center justify-center border border-zincLine hover:border-warn hover:text-warn disabled:opacity-50"
           >
             <MoreHorizontal className="h-4 w-4" />
@@ -1456,6 +1616,12 @@ function OverviewPanel({
     !TERMINAL_STATUSES.has(item.status);
   const activePlan = item.installmentPlans[0];
   const latestPromise = item.paymentPromises[0];
+  const fieldErrors = reviewable
+    ? getReviewFieldErrors(validationErrors, form)
+    : {};
+  const generalValidationErrors = validationErrors.filter(
+    (error) => !validationErrorField(error)
+  );
 
   return (
     <div className="mx-auto max-w-5xl px-6 py-6">
@@ -1497,12 +1663,14 @@ function OverviewPanel({
                   <ReviewField
                     label="Faktúra č."
                     value={form.invoiceNumber}
+                    error={fieldErrors.invoiceNumber}
                     onChange={(value) => onFieldChange("invoiceNumber", value)}
                   />
                   <ReviewField
                     label="Dátum splatnosti"
                     type="date"
                     value={form.dueDate}
+                    error={fieldErrors.dueDate}
                     onChange={(value) => onFieldChange("dueDate", value)}
                   />
                   <ReviewField
@@ -1513,6 +1681,7 @@ function OverviewPanel({
                   <ReviewField
                     label="Odberateľ"
                     value={form.debtorName}
+                    error={fieldErrors.debtorName}
                     onChange={(value) => onFieldChange("debtorName", value)}
                   />
                   <ReviewField
@@ -1525,11 +1694,16 @@ function OverviewPanel({
                       label="Suma na úhradu"
                       type="number"
                       value={form.amountTotal}
+                      error={fieldErrors.amountTotal}
                       onChange={(value) => onFieldChange("amountTotal", value)}
                     />
                     <ReviewField
                       label="Mena"
                       value={form.currency}
+                      maxLength={3}
+                      pattern="[A-Z]{3}"
+                      help="ISO kód meny, napr. EUR."
+                      error={fieldErrors.currency}
                       onChange={(value) => onFieldChange("currency", value)}
                     />
                   </div>
@@ -1583,13 +1757,13 @@ function OverviewPanel({
               )}
             </div>
 
-            {item.warnings.length || validationErrors.length ? (
+            {item.warnings.length || generalValidationErrors.length ? (
               <div className="mt-3 border border-[#e2bd78] bg-[#fff9ed] p-3 text-sm text-[#845112]">
                 <div className="mb-1 flex items-center gap-2 font-semibold">
                   <AlertTriangle className="h-4 w-4" />
                   Vyžaduje pozornosť
                 </div>
-                {[...item.warnings, ...validationErrors].map((warning) => (
+                {[...item.warnings, ...generalValidationErrors].map((warning) => (
                   <div key={warning}>{warning}</div>
                 ))}
               </div>
@@ -1898,23 +2072,64 @@ function ReviewField({
   label,
   value,
   onChange,
-  type = "text"
+  type = "text",
+  error,
+  help,
+  maxLength,
+  pattern
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   type?: "text" | "number" | "date" | "email";
+  error?: string;
+  help?: string;
+  maxLength?: number;
+  pattern?: string;
 }) {
+  const inputId = useMemo(
+    () => `field-${label.toLocaleLowerCase("sk").replace(/[^a-z0-9]+/gi, "-")}`,
+    [label]
+  );
+  const describedBy = [
+    help ? `${inputId}-help` : null,
+    error ? `${inputId}-error` : null
+  ]
+    .filter(Boolean)
+    .join(" ");
   return (
     <label className="block min-w-0">
       <span className="text-xs text-steel">{label}</span>
       <input
-        className="mt-1 h-10 w-full border border-zincLine bg-white px-3 text-sm font-medium outline-none transition focus:border-ink focus:ring-0"
+        id={inputId}
+        className={`mt-1 h-10 w-full border bg-white px-3 text-sm font-medium outline-none transition focus:ring-0 ${
+          error
+            ? "border-[#b04f32] focus:border-[#b04f32]"
+            : "border-zincLine focus:border-ink"
+        }`}
         type={type}
         step={type === "number" ? "0.01" : undefined}
+        inputMode={type === "number" ? "decimal" : undefined}
+        maxLength={maxLength}
+        pattern={pattern}
+        aria-invalid={error ? "true" : undefined}
+        aria-describedby={describedBy || undefined}
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />
+      {help ? (
+        <span id={`${inputId}-help`} className="mt-1 block text-[11px] text-steel">
+          {help}
+        </span>
+      ) : null}
+      {error ? (
+        <span
+          id={`${inputId}-error`}
+          className="mt-1 block text-[11px] font-medium text-[#9c3e25]"
+        >
+          {error}
+        </span>
+      ) : null}
     </label>
   );
 }
@@ -2110,6 +2325,53 @@ function toReviewForm(item: DashboardCase | null): ReviewFormState {
     iban: item?.iban ?? "",
     variableSymbol: item?.variableSymbol ?? ""
   };
+}
+
+async function readApiPayload(response: Response): Promise<Record<string, any>> {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+}
+
+function getReviewFieldErrors(
+  errors: string[],
+  form: ReviewFormState
+): ReviewFieldErrors {
+  const fieldErrors: ReviewFieldErrors = {};
+  for (const error of errors) {
+    const field = validationErrorField(error);
+    if (field && !fieldErrors[field]) {
+      fieldErrors[field] = error;
+    }
+  }
+
+  if (form.currency.trim() && !/^[A-Z]{3}$/.test(form.currency.trim())) {
+    fieldErrors.currency = "Mena musí byť trojpísmenový ISO kód, napr. EUR.";
+  }
+
+  return fieldErrors;
+}
+
+function validationErrorField(error: string): keyof ReviewFormState | null {
+  const normalized = error.toLocaleLowerCase("sk");
+  if (normalized.includes("číslo faktúry")) {
+    return "invoiceNumber";
+  }
+  if (normalized.includes("dátum splatnosti")) {
+    return "dueDate";
+  }
+  if (normalized.includes("suma")) {
+    return "amountTotal";
+  }
+  if (normalized.includes("odberateľ") || normalized.includes("dlžník")) {
+    return "debtorName";
+  }
+  if (normalized.includes("mena")) {
+    return "currency";
+  }
+  return null;
 }
 
 function toDraftPayload(form: ReviewFormState) {

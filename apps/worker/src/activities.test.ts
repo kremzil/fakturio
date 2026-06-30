@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { EmailProviderError } from "@fakturio/email";
 
 const caseFindUniqueOrThrow = vi.fn();
 const caseFindUnique = vi.fn();
@@ -296,6 +297,35 @@ describe("payment-check outbox", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           automationPauseReason: "MISSING_CUSTOMER_EMAIL",
+          automationPausedAt: expect.any(Date),
+          nextActionAt: null
+        })
+      })
+    );
+  });
+
+  it("pauses instead of retry-looping on permanent customer email rejection", async () => {
+    sendEmail.mockRejectedValue(
+      new EmailProviderError({
+        code: "MESSAGE_REJECTED",
+        provider: "ses",
+        message: "SES rejected the message.",
+        retryable: false
+      })
+    );
+
+    const result = await activities.sendPaymentCheckEmail({
+      caseId: "case-1",
+      organizationId: "org-A",
+      sourceKey: "due-date:case-1:2026-06-02",
+      reason: "DUE_DATE"
+    });
+
+    expect(result).toBeNull();
+    expect(txCaseUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          automationPauseReason: "CUSTOMER_EMAIL_REJECTED",
           automationPausedAt: expect.any(Date),
           nextActionAt: null
         })

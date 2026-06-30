@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { EmailProviderError } from "./errors";
 import { FixtureEmailProvider } from "./fixture-provider";
 import { parseMimeEmail } from "./mime";
+import { SesEmailProvider } from "./ses-provider";
 
 describe("email provider", () => {
   it("records fixture emails for local workflow tests", async () => {
@@ -43,5 +45,32 @@ describe("email provider", () => {
       subject: "Re: Invoice",
       textBody: "Faktúra bola uhradená."
     });
+  });
+
+  it("wraps SES message rejection as a permanent provider error", async () => {
+    const provider = new SesEmailProvider({
+      region: "eu-central-1",
+      client: {
+        async send() {
+          const error = new Error("custom provider text");
+          error.name = "MessageRejected";
+          throw error;
+        }
+      } as never
+    });
+
+    await expect(
+      provider.sendEmail({
+        from: "collection@example.com",
+        to: ["unverified@example.com"],
+        subject: "Test",
+        textBody: "Test"
+      })
+    ).rejects.toMatchObject({
+      name: "EmailProviderError",
+      code: "MESSAGE_REJECTED",
+      provider: "ses",
+      retryable: false
+    } satisfies Partial<EmailProviderError>);
   });
 });

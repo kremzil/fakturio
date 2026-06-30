@@ -221,17 +221,8 @@ export class InvoiceIntakeService {
 
     const caseIds: string[] = [];
     for (const [groupIndex, group] of triage.groups.entries()) {
-      const primary = files[group.primaryInvoiceAttachmentIndex];
-      if (!primary) {
-        throw new Error("Attachment triage selected a missing primary invoice.");
-      }
-      const supporting = group.supportingAttachmentIndexes.map((index) => {
-        const file = files[index];
-        if (!file) {
-          throw new Error("Attachment triage selected a missing supporting document.");
-        }
-        return file;
-      });
+      const primary = files[group.primaryInvoiceAttachmentIndex]!;
+      const supporting = group.supportingAttachmentIndexes.map((index) => files[index]!);
 
       if (groupIndex === 0) {
         await this.populateExistingCaseFromFile({
@@ -344,17 +335,10 @@ export class InvoiceIntakeService {
 
     const cases: IntakeCaseResult[] = [];
     for (const group of triage.groups) {
-      const primary = acceptedAttachments[group.primaryInvoiceAttachmentIndex];
-      if (!primary) {
-        throw new Error("Attachment triage selected a missing primary invoice.");
-      }
-      const supportingAttachments = group.supportingAttachmentIndexes.map((index) => {
-        const attachment = acceptedAttachments[index];
-        if (!attachment) {
-          throw new Error("Attachment triage selected a missing supporting document.");
-        }
-        return attachment;
-      });
+      const primary = acceptedAttachments[group.primaryInvoiceAttachmentIndex]!;
+      const supportingAttachments = group.supportingAttachmentIndexes.map(
+        (index) => acceptedAttachments[index]!
+      );
       const idempotencyKey = inboundInvoiceIdempotencyKey(input.email, primary);
       const existing = await findExistingInboundCase(idempotencyKey);
       if (existing) {
