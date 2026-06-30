@@ -155,7 +155,7 @@ describe("debtor reply policy", () => {
     });
   });
 
-  it("ignores sender mismatches and automated replies", () => {
+  it("routes sender mismatches to manual review and ignores automated replies", () => {
     const base = {
       classification: classification({ intent: "PAID" }),
       automated: false,
@@ -167,7 +167,7 @@ describe("debtor reply policy", () => {
     };
     expect(
       decideDebtorReply({ ...base, senderMatchesDebtor: false })
-    ).toEqual({ kind: "IGNORE", reason: "SENDER_MISMATCH" });
+    ).toEqual({ kind: "PAUSE_MANUAL_REVIEW", reason: "SENDER_MISMATCH" });
     expect(
       decideDebtorReply({
         ...base,

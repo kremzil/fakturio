@@ -28,11 +28,13 @@ const STATE_CHANGE_SIDE_EFFECT_FREE_PATCH =
   "state-change-side-effect-free-v1";
 const RETRY_PAYMENT_CHECK_AFTER_PAUSE_PATCH =
   "retry-payment-check-after-pause-v1";
+const SCHEDULED_NOOP_GUARD_PATCH = "scheduled-noop-guard-v1";
 const WORKFLOW_COMMAND_TYPES = {
   caseStateChanged: "CASE_STATE_CHANGED",
   debtorReplyReceived: "DEBTOR_REPLY_RECEIVED",
   paymentCheckResolved: "PAYMENT_CHECK_RESOLVED"
 } as const;
+type ScheduledActionResult = "ACTION_STARTED" | "WAIT_FOR_SIGNAL";
 
 const activities = proxyActivities<CaseWorkflowActivities>({
   startToCloseTimeout: CASE_ACTIVITY_START_TO_CLOSE_TIMEOUT_MS,
@@ -177,7 +179,10 @@ async function collectionCaseWorkflow(
     }
 
     snapshot = await activities.loadCaseSnapshot(input);
-    await runScheduledAction(input, snapshot);
+    const result = await runScheduledAction(input, snapshot);
+    if (result === "WAIT_FOR_SIGNAL") {
+      await condition(() => pendingCommands.length > 0);
+    }
   }
 }
 
@@ -238,10 +243,19 @@ async function handleCommand(
 async function runScheduledAction(
   input: CaseWorkflowInput,
   snapshot: CaseSnapshot
-): Promise<void> {
+): Promise<ScheduledActionResult> {
   if (snapshot.status === "INSTALLMENT_ACTIVE") {
     if (!snapshot.nextInstallmentPaymentId) {
-      return;
+      if (!patched(SCHEDULED_NOOP_GUARD_PATCH)) {
+        return "ACTION_STARTED";
+      }
+      await activities.recordWorkflowEvent({
+        ...input,
+        type: "WORKFLOW_WAITING",
+        note:
+          "Scheduled installment check has no next installment payment. Waiting for a case update."
+      });
+      return "WAIT_FOR_SIGNAL";
     }
     await activities.sendPaymentCheckEmail({
       ...input,
@@ -249,7 +263,7 @@ async function runScheduledAction(
       reason: "INSTALLMENT_PAYMENT",
       installmentPaymentId: snapshot.nextInstallmentPaymentId
     });
-    return;
+    return "ACTION_STARTED";
   }
 
   if (
@@ -263,7 +277,18 @@ async function runScheduledAction(
       sourceKey: `${reason.toLowerCase()}:${input.caseId}:${snapshot.nextActionAt}`,
       reason
     });
+    return "ACTION_STARTED";
   }
+
+  if (!patched(SCHEDULED_NOOP_GUARD_PATCH)) {
+    return "ACTION_STARTED";
+  }
+  await activities.recordWorkflowEvent({
+    ...input,
+    type: "WORKFLOW_WAITING",
+    note: `Scheduled action ignored for unsupported status ${snapshot.status}. Waiting for a case update.`
+  });
+  return "WAIT_FOR_SIGNAL";
 }
 
 async function sendReminder(

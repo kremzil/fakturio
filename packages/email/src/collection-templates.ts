@@ -187,6 +187,26 @@ export function buildInstallmentBrokenNotice(input: {
   );
 }
 
+export function buildCustomerAuthorizedDebtorMessage(input: {
+  invoiceNumber: string;
+  message: string;
+}): CollectionTemplate {
+  return template(
+    `Správa veriteľa k faktúre ${input.invoiceNumber}`,
+    [
+      "Dobrý deň,",
+      "",
+      `k faktúre ${input.invoiceNumber} Vám posielame správu podľa pokynu veriteľa:`,
+      "",
+      input.message,
+      "",
+      "Prosíme, odpovedzte priamo na tento email.",
+      "",
+      "Ďakujeme."
+    ]
+  );
+}
+
 export function buildCustomerExceptionNotice(input: {
   invoiceNumber: string;
   title: string;
@@ -203,6 +223,40 @@ export function buildCustomerExceptionNotice(input: {
       "",
       "Automatický postup bol pozastavený."
     ]
+  );
+}
+
+export function buildCustomerDebtorReplyDecisionRequest(input: {
+  invoiceNumber: string;
+  debtorName: string | null;
+  debtorMessage: string | null;
+  reason: string;
+  caseUrl: string;
+}): CollectionTemplate {
+  return template(
+    `FAKTURIO: potrebujeme rozhodnutie k ${input.invoiceNumber}`,
+    [
+      "Dobrý deň,",
+      "",
+      `Dlžník odpovedal k faktúre ${input.invoiceNumber}.`,
+      input.debtorName ? `Dlžník: ${input.debtorName}` : "",
+      "",
+      "Správa dlžníka:",
+      input.debtorMessage ? `„${input.debtorMessage}“` : "Správa nemá čitateľný text.",
+      "",
+      "Automatizácia potrebuje vaše rozhodnutie:",
+      input.reason,
+      "",
+      "Môžete odpovedať priamo na tento email napríklad:",
+      "- pošlite dlžníkovi štandardný splátkový kalendár,",
+      "- pošlite mu doplňujúcu správu: ...",
+      "- pokračujte štandardným spôsobom,",
+      "- pozastavte prípad.",
+      "",
+      `Prípad v dashboarde: ${input.caseUrl}`,
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
   );
 }
 
@@ -397,6 +451,7 @@ export function buildCustomerCaseStatusReply(input: {
   currency: string | null;
   dueDate: string | null;
   debtorName: string | null;
+  recentEvents?: string[];
   confirmUrl?: string | null;
   dashboardUrl?: string | null;
 }): CollectionTemplate {
@@ -416,6 +471,9 @@ export function buildCustomerCaseStatusReply(input: {
       `Dlžník: ${input.debtorName || "nezadaný"}`,
       `Suma: ${amount}`,
       `Splatnosť: ${dueDate}`,
+      ...(input.recentEvents?.length
+        ? ["", "Posledné kroky:", ...input.recentEvents.map((event) => `- ${event}`)]
+        : []),
       input.confirmUrl
         ? `Ak sú údaje správne, potvrďte spustenie kontroly tu: ${input.confirmUrl}`
         : "",

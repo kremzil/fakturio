@@ -42,6 +42,7 @@ describe("shared domain", () => {
     expect(canTransitionCase("OVERDUE", "READY_FOR_LEGAL_ACTION")).toBe(false);
     expect(canTransitionCase("FINAL_NOTICE_SENT", "READY_FOR_LEGAL_ACTION")).toBe(true);
     expect(canTransitionCase("INSTALLMENT_PLAN_SENT", "EMAIL_REMINDER_1_SENT")).toBe(true);
+    expect(canTransitionCase("MANUAL_REVIEW_REQUIRED", "INSTALLMENT_PLAN_SENT")).toBe(true);
     expect(() =>
       assertCaseTransition("OVERDUE", "READY_FOR_LEGAL_ACTION")
     ).toThrow(/Unsupported case transition/);
@@ -49,7 +50,7 @@ describe("shared domain", () => {
 
   it("parses customer message classification schema", () => {
     const parsed = customerMessageClassificationSchema.parse({
-      intent: "PROVIDE_INVOICE_FIELDS",
+      intent: "REQUEST_STANDARD_INSTALLMENT_PLAN",
       confidence: 0.91,
       summary: "Customer clarified missing invoice fields.",
       extractedInvoiceFields: {
@@ -78,6 +79,6 @@ describe("shared domain", () => {
       replyDraft: null
     });
 
-    expect(parsed.intent).toBe("PROVIDE_INVOICE_FIELDS");
+    expect(parsed.intent).toBe("REQUEST_STANDARD_INSTALLMENT_PLAN");
   });
 });

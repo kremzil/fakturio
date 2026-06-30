@@ -11,6 +11,7 @@ import {
 } from "@fakturio/email";
 import {
   CASE_EVENT_TYPES,
+  CUSTOMER_COMMUNICATION_KINDS,
   cleanText,
   createCaseClarificationAddress,
   MAX_INVOICE_UPLOAD_BYTES,
@@ -159,7 +160,7 @@ export class InvoiceIntakeService {
     const replyCommunication = await createInboundCommunication(
       input.caseId,
       input.email,
-      { kind: "customer-multi-attachment-clarification-reply" },
+      { kind: CUSTOMER_COMMUNICATION_KINDS.multiAttachmentClarificationReply },
       `customer-multi-attachment-reply:${input.email.provider}:${input.email.providerId}:${input.caseId}`
     );
 
@@ -904,7 +905,7 @@ export class InvoiceIntakeService {
           textBody: template.textBody,
           htmlBody: template.htmlBody,
           rawPayload: {
-            kind: "customer-invoice-clarification-request",
+            kind: CUSTOMER_COMMUNICATION_KINDS.invoiceClarificationRequest,
             replyTo,
             missingFields: input.missingFields
           }
@@ -995,7 +996,7 @@ export class InvoiceIntakeService {
           textBody: template.textBody,
           htmlBody: template.htmlBody,
           rawPayload: {
-            kind: "customer-multi-attachment-clarification-request",
+            kind: CUSTOMER_COMMUNICATION_KINDS.multiAttachmentClarificationRequest,
             replyTo,
             attachmentNames: input.attachmentNames
           }

@@ -307,6 +307,93 @@ describe("caseWorkflow durability", () => {
     });
   }, 60_000);
 
+  it("parks instead of hot-looping on an unsupported scheduled status", async () => {
+    const now = await testEnv.currentTimeMs();
+    let state: CaseSnapshot = {
+      ...snapshot("EMAIL_REMINDER_2_SENT", null),
+      nextActionAt: new Date(now - 60_000).toISOString()
+    };
+    const events: unknown[] = [];
+    const checks: PaymentCheckReason[] = [];
+    const activities = createActivities({
+      snapshot: () => state,
+      recordWorkflowEvent: (event) => events.push(event),
+      onPaymentCheck: (reason) => checks.push(reason)
+    });
+    const { worker, taskQueue } = await createWorker(testEnv, activities);
+
+    await worker.runUntil(async () => {
+      const handle = await testEnv.client.workflow.start("caseWorkflow", {
+        workflowId: `case-${randomUUID()}`,
+        taskQueue,
+        args: [{ caseId: "case-1", organizationId: "org-1" }]
+      });
+      await testEnv.sleep("10 days");
+      expect(checks).toEqual([]);
+      expect(
+        events.filter(
+          (event) =>
+            (event as { type?: string; note?: string }).type ===
+              "WORKFLOW_WAITING" &&
+            (event as { note?: string }).note?.includes("unsupported status")
+        )
+      ).toHaveLength(1);
+
+      state = { ...state, status: "CLOSED_CANCELLED" };
+      await handle.signal(caseStateChangedSignal, {
+        commandId: "close-after-park",
+        type: WORKFLOW_COMMAND_TYPES.caseStateChanged,
+        payload: { status: "CLOSED_CANCELLED" }
+      });
+      await handle.result();
+    });
+  }, 60_000);
+
+  it("parks when an installment schedule is due but no payment id is available", async () => {
+    const now = await testEnv.currentTimeMs();
+    let state: CaseSnapshot = {
+      ...snapshot("INSTALLMENT_ACTIVE", null),
+      nextActionAt: new Date(now - 60_000).toISOString(),
+      nextInstallmentPaymentId: null
+    };
+    const events: unknown[] = [];
+    const checks: PaymentCheckReason[] = [];
+    const activities = createActivities({
+      snapshot: () => state,
+      recordWorkflowEvent: (event) => events.push(event),
+      onPaymentCheck: (reason) => checks.push(reason)
+    });
+    const { worker, taskQueue } = await createWorker(testEnv, activities);
+
+    await worker.runUntil(async () => {
+      const handle = await testEnv.client.workflow.start("caseWorkflow", {
+        workflowId: `case-${randomUUID()}`,
+        taskQueue,
+        args: [{ caseId: "case-1", organizationId: "org-1" }]
+      });
+      await testEnv.sleep("10 days");
+      expect(checks).toEqual([]);
+      expect(
+        events.filter(
+          (event) =>
+            (event as { type?: string; note?: string }).type ===
+              "WORKFLOW_WAITING" &&
+            (event as { note?: string }).note?.includes(
+              "no next installment payment"
+            )
+        )
+      ).toHaveLength(1);
+
+      state = { ...state, status: "CLOSED_CANCELLED" };
+      await handle.signal(caseStateChangedSignal, {
+        commandId: "close-installment-after-park",
+        type: WORKFLOW_COMMAND_TYPES.caseStateChanged,
+        payload: { status: "CLOSED_CANCELLED" }
+      });
+      await handle.result();
+    });
+  }, 60_000);
+
   it("fails on organization mismatch before recording an event", async () => {
     const recordWorkflowEvent = vi.fn();
     const activities = createActivities({

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { prisma } from "@fakturio/db";
 import { MockAiProvider } from "@fakturio/ai";
 import {
+  CUSTOMER_COMMUNICATION_KINDS,
   createCaseClarificationAddress,
   requireInboundReplyTokenSecret,
   type AiProvider
@@ -283,6 +284,472 @@ describe("email invoice intake idempotency", () => {
     });
     expect(unchanged.status).toBe("WAITING_FOR_DUE_DATE");
     expect(sent[0]?.textBody).toContain("automaticky nevykonáme");
+  });
+
+  it("uses one AI pass for alias case matching and does not include confirm links in status-only replies", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-alias-status-outbound@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        sourceType: "EMAIL",
+        status: "PARSED",
+        invoiceNumber: "FV-ALIAS-STATUS",
+        dueDate: new Date("2026-07-10T00:00:00.000Z"),
+        amountTotal: 100,
+        currency: "EUR",
+        debtorSnapshot: { name: "Alias Debtor s.r.o." }
+      }
+    });
+    const classifyCustomerMessage = vi.fn(async () => ({
+      intent: "ASK_CASE_STATUS" as const,
+      confidence: 0.96,
+      summary: "Customer asked for case status.",
+      extractedInvoiceFields: emptyFields(),
+      debtorContactPatch: { email: null, name: null },
+      caseReference: {
+        caseId: collectionCase.id,
+        invoiceNumber: "FV-ALIAS-STATUS",
+        debtorName: null
+      },
+      customerNote: null,
+      requestedAction: null,
+      needsHumanReview: false,
+      replyDraft: null
+    }));
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(classifyCustomerMessage),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-alias-status`,
+        subject: "FV-ALIAS-STATUS",
+        textBody: "Aký je stav prípadu FV-ALIAS-STATUS?",
+        attachments: []
+      }),
+      {
+        organizationId,
+        matchedAddress: "abc-sro@fakturio.test"
+      }
+    );
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      intent: "ASK_CASE_STATUS",
+      replySent: true
+    });
+    expect(classifyCustomerMessage).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.textBody).not.toContain("/confirm-link?token=");
+    expect(sent[0]?.textBody).toContain("/?case=");
+  });
+
+  it("starts a reviewed case when the customer explicitly confirms by email", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-email-confirm-outbound@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Email Confirm Debtor s.r.o.",
+        email: "email-confirm-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        debtorId: debtor.id,
+        sourceType: "EMAIL",
+        status: "PARSED",
+        invoiceNumber: "FV-EMAIL-CONFIRM",
+        dueDate: new Date("2026-07-10T00:00:00.000Z"),
+        amountTotal: 300,
+        currency: "EUR"
+      }
+    });
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async () =>
+        customerClassification({
+          intent: "REQUEST_CONFIRM_INVOICE",
+          summary: "Customer confirmed the invoice and asked to start the case.",
+          requestedAction: "spustiť prípad"
+        })
+      ),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-email-confirm`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: kontrola",
+        textBody: "Potvrdzujem, spusti prípad.",
+        attachments: []
+      })
+    );
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      status: "WAITING_FOR_DUE_DATE",
+      intent: "REQUEST_CONFIRM_INVOICE",
+      replySent: true
+    });
+    const updated = await prisma.case.findUniqueOrThrow({
+      where: { id: collectionCase.id }
+    });
+    expect(updated.confirmedAt).toBeTruthy();
+    expect(updated.status).toBe("WAITING_FOR_DUE_DATE");
+    expect(
+      await prisma.caseEvent.count({
+        where: {
+          caseId: collectionCase.id,
+          type: "WORKFLOW_WAITING"
+        }
+      })
+    ).toBe(1);
+    expect(sent[0]?.textBody).toContain("spustili automatickú kontrolu");
+  });
+
+  it("sends a standard installment proposal when the customer authorizes it by email", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-installment-authorized-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Installment Debtor s.r.o.",
+        email: "installment-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        debtorId: debtor.id,
+        sourceType: "EMAIL",
+        status: "MANUAL_REVIEW_REQUIRED",
+        invoiceNumber: "FV-INSTALLMENT-AUTH",
+        dueDate: new Date("2026-06-01T00:00:00.000Z"),
+        amountTotal: 1000,
+        currency: "EUR",
+        confirmedAt: new Date(),
+        automationPausedAt: new Date(),
+        automationPauseReason: "AMOUNT_MISMATCH"
+      }
+    });
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async () =>
+        customerClassification({
+          intent: "REQUEST_STANDARD_INSTALLMENT_PLAN",
+          summary: "Customer authorized the standard three-payment installment plan.",
+          requestedAction: "štandardný splátkový kalendár"
+        })
+      ),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-installment-authorized`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: splátky",
+        textBody: "Nech platí štandardnou splátkou, suma/3.",
+        attachments: []
+      })
+    );
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      status: "INSTALLMENT_PLAN_SENT",
+      intent: "REQUEST_STANDARD_INSTALLMENT_PLAN",
+      replySent: true
+    });
+    const plan = await prisma.installmentPlan.findFirstOrThrow({
+      where: { caseId: collectionCase.id },
+      include: { payments: { orderBy: { sequence: "asc" } } }
+    });
+    expect(plan.status).toBe("PROPOSED");
+    expect(plan.payments.map((payment) => Number(payment.amount))).toEqual([
+      333.33,
+      333.33,
+      333.34
+    ]);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toMatchObject({
+      to: ["installment-debtor@example.com"],
+      replyTo: [expect.stringMatching(/^reply\+/)]
+    });
+    expect(sent[0]?.textBody).toContain("štandardný splátkový kalendár");
+    expect(sent[1]?.textBody).toContain("poslali dlžníkovi");
+  });
+
+  it("does not restore an automation-paused case to parsed for a status question", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-paused-status-outbound@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        sourceType: "EMAIL",
+        status: "MANUAL_REVIEW_REQUIRED",
+        invoiceNumber: "FV-PAUSED-STATUS",
+        dueDate: new Date("2026-07-10T00:00:00.000Z"),
+        amountTotal: 100,
+        currency: "EUR",
+        confirmedAt: new Date(),
+        automationPausedAt: new Date(),
+        automationPauseReason: "AMOUNT_MISMATCH"
+      }
+    });
+
+    await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async () =>
+        customerClassification({
+          intent: "ASK_CASE_STATUS",
+          summary: "Customer asked for the debt amount."
+        })
+      ),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-paused-status`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: stav",
+        textBody: "Aká je suma dlhu?",
+        attachments: []
+      })
+    );
+
+    const unchanged = await prisma.case.findUniqueOrThrow({
+      where: { id: collectionCase.id }
+    });
+    expect(unchanged.status).toBe("MANUAL_REVIEW_REQUIRED");
+    expect(unchanged.automationPauseReason).toBe("AMOUNT_MISMATCH");
+    expect(sent[0]?.textBody).toContain("Suma:");
+  });
+
+  it("sends a customer-authorized debtor message and can report recent case history", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-debtor-message-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Message Debtor s.r.o.",
+        email: "message-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        debtorId: debtor.id,
+        sourceType: "EMAIL",
+        status: "EMAIL_REMINDER_1_SENT",
+        invoiceNumber: "FV-MESSAGE-1",
+        dueDate: new Date("2026-06-01T00:00:00.000Z"),
+        amountTotal: 900,
+        currency: "EUR",
+        confirmedAt: new Date(),
+        events: {
+          create: [
+            {
+              actorType: "WORKFLOW",
+              type: "EMAIL_SENT",
+              note: "First reminder sent."
+            },
+            {
+              actorType: "WORKFLOW",
+              type: "AUTOMATION_PAUSED",
+              note: "Debtor requested custom installments."
+            }
+          ]
+        }
+      }
+    });
+
+    const service = new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async (input) =>
+        input.messageText.toLowerCase().includes("hist")
+          ? customerClassification({
+              intent: "ASK_CASE_HISTORY",
+              summary: "Customer asks what actions were taken."
+            })
+          : customerClassification({
+              intent: "REQUEST_SEND_DEBTOR_MESSAGE",
+              summary: "Customer asks to send an additional message to debtor.",
+              requestedAction: "pošlite doplňujúcu správu",
+              replyDraft:
+                "Prosíme, potvrďte, či viete uhradiť faktúru do konca týždňa."
+            })
+      ),
+      email: emailProvider
+    });
+
+    const sentMessage = await service.process(
+      inboundEmail({
+        providerId: `${RUN_ID}-debtor-message`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: čo ďalej",
+        textBody: "Pošlite dlžníkovi doplňujúcu správu.",
+        attachments: []
+      })
+    );
+    expect(sentMessage).toMatchObject({
+      caseId: collectionCase.id,
+      intent: "REQUEST_SEND_DEBTOR_MESSAGE",
+      replySent: true
+    });
+    expect(sent[0]).toMatchObject({
+      to: ["message-debtor@example.com"],
+      replyTo: [expect.stringMatching(/^reply\+/)]
+    });
+    expect(sent[0]?.textBody).toContain("Prosíme, potvrďte");
+    expect(sent[1]?.textBody).toContain("Správu sme podľa vášho pokynu odoslali");
+
+    await service.process(
+      inboundEmail({
+        providerId: `${RUN_ID}-case-history`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: história",
+        textBody: "Aká je história prípadu?",
+        attachments: []
+      })
+    );
+    expect(sent[2]?.textBody).toContain("Posledné kroky:");
+    expect(sent[2]?.textBody).toContain("First reminder sent.");
+  });
+
+  it("stores ambiguous alias emails in a manual-review container case", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-ambiguous-alias-outbound@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const classifyCustomerMessage = vi.fn(async () => ({
+      intent: "OTHER" as const,
+      confidence: 0.83,
+      summary: "Customer sent a message without a unique case reference.",
+      extractedInvoiceFields: emptyFields(),
+      debtorContactPatch: { email: null, name: null },
+      caseReference: {
+        caseId: null,
+        invoiceNumber: null,
+        debtorName: null
+      },
+      customerNote: "Please check this.",
+      requestedAction: null,
+      needsHumanReview: false,
+      replyDraft: null
+    }));
+    const service = new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(classifyCustomerMessage),
+      email: emailProvider
+    });
+    const email = inboundEmail({
+      providerId: `${RUN_ID}-ambiguous-alias`,
+      subject: "Prosba",
+      textBody: "Prosím pozrite sa na moje prípady.",
+      attachments: []
+    });
+
+    const first = await service.process(email, {
+      organizationId,
+      matchedAddress: "abc-sro@fakturio.test"
+    });
+    const second = await service.process(email, {
+      organizationId,
+      matchedAddress: "abc-sro@fakturio.test"
+    });
+
+    expect(first).toMatchObject({
+      organizationId,
+      duplicate: false,
+      status: "MANUAL_REVIEW_REQUIRED",
+      replySent: true
+    });
+    expect(second).toMatchObject({
+      caseId: first?.caseId,
+      communicationId: first?.communicationId,
+      duplicate: true
+    });
+    expect(sent).toHaveLength(1);
+    const communication = await prisma.communication.findUniqueOrThrow({
+      where: { id: first?.communicationId ?? "" }
+    });
+    expect(communication.rawPayload).toMatchObject({
+      kind: CUSTOMER_COMMUNICATION_KINDS.unmatchedAssistantMessage,
+      reason: "NO_CASE_MATCH"
+    });
+    expect(
+      await prisma.caseEvent.count({
+        where: {
+          caseId: first?.caseId ?? "",
+          type: "MANUAL_REVIEW_REQUIRED"
+        }
+      })
+    ).toBe(1);
   });
 
   it("splits clearly separate invoice attachments into separate cases", async () => {
@@ -615,6 +1082,65 @@ function stagedMultiAttachmentAi(
   };
 }
 
+function emptyFields() {
+  return {
+    invoiceNumber: null,
+    dueDate: null,
+    amountTotal: null,
+    currency: null,
+    debtorName: null,
+    debtorEmail: null,
+    supplierName: null,
+    iban: null,
+    variableSymbol: null
+  };
+}
+
+function customerClassification(
+  overrides: Partial<Awaited<ReturnType<AiProvider["classifyCustomerMessage"]>>>
+): Awaited<ReturnType<AiProvider["classifyCustomerMessage"]>> {
+  return {
+    intent: "OTHER",
+    confidence: 0.96,
+    summary: "Customer message.",
+    extractedInvoiceFields: emptyFields(),
+    debtorContactPatch: { email: null, name: null },
+    caseReference: {
+      caseId: null,
+      invoiceNumber: null,
+      debtorName: null
+    },
+    customerNote: null,
+    requestedAction: null,
+    needsHumanReview: false,
+    replyDraft: null,
+    ...overrides
+  };
+}
+
+function customerMessageOnlyAi(
+  classifyCustomerMessage: AiProvider["classifyCustomerMessage"]
+): AiProvider {
+  return {
+    async extractInvoice() {
+      throw new Error("not used");
+    },
+    async classifyDebtorReply() {
+      throw new Error("not used");
+    },
+    async classifyInvoiceEmailAttachments() {
+      throw new Error("not used");
+    },
+    classifyCustomerMessage,
+    async generateDebtorEmail() {
+      throw new Error("not used");
+    },
+    async summarizeCase() {
+      throw new Error("not used");
+    }
+  };
+}
+
 function missingInvoiceAi(): AiProvider {
   return {
     async extractInvoice() {
@@ -686,7 +1212,7 @@ function missingInvoiceAi(): AiProvider {
         },
         customerNote: null,
         requestedAction: "send details by email for review",
-        needsHumanReview: true,
+        needsHumanReview: false,
         replyDraft: null
       };
     },

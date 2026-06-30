@@ -12,12 +12,22 @@ import { DebtorReplyService } from "./debtor-reply";
 
 const RUN_ID = `it-reply-${Date.now()}-${Math.floor(Math.random() * 1e5)}`;
 const organizationId = `${RUN_ID}-org`;
+const otherOrganizationId = `${RUN_ID}-other-org`;
 const debtorId = `${RUN_ID}-debtor`;
+const otherDebtorId = `${RUN_ID}-other-debtor`;
 const caseId = `${RUN_ID}-case`;
+const otherCaseId = `${RUN_ID}-other-case`;
 
 beforeAll(async () => {
-  await prisma.organization.create({
-    data: { id: organizationId, name: "Reply Org", slug: organizationId }
+  await prisma.organization.createMany({
+    data: [
+      { id: organizationId, name: "Reply Org", slug: organizationId },
+      {
+        id: otherOrganizationId,
+        name: "Other Reply Org",
+        slug: otherOrganizationId
+      }
+    ]
   });
   await prisma.debtor.create({
     data: {
@@ -25,6 +35,14 @@ beforeAll(async () => {
       organizationId,
       name: "Debtor s.r.o.",
       email: "debtor@example.com"
+    }
+  });
+  await prisma.debtor.create({
+    data: {
+      id: otherDebtorId,
+      organizationId: otherOrganizationId,
+      name: "Other Debtor s.r.o.",
+      email: "other-debtor@example.com"
     }
   });
   await prisma.case.create({
@@ -39,10 +57,24 @@ beforeAll(async () => {
       dueDate: new Date("2026-06-01T00:00:00.000Z")
     }
   });
+  await prisma.case.create({
+    data: {
+      id: otherCaseId,
+      organizationId: otherOrganizationId,
+      debtorId: otherDebtorId,
+      status: "EMAIL_REMINDER_1_SENT",
+      invoiceNumber: "INV-REPLY-OTHER",
+      amountTotal: 200,
+      currency: "EUR",
+      dueDate: new Date("2026-06-01T00:00:00.000Z")
+    }
+  });
 });
 
 afterAll(async () => {
-  await prisma.organization.deleteMany({ where: { id: organizationId } });
+  await prisma.organization.deleteMany({
+    where: { id: { in: [organizationId, otherOrganizationId] } }
+  });
   await prisma.$disconnect();
 });
 
@@ -118,6 +150,46 @@ describe("inbound debtor reply intake", () => {
       })
     );
     expect(result).toMatchObject({ caseId, classificationPending: true });
+  });
+
+  it("does not auto-correlate ambiguous thread ids across organizations", async () => {
+    const sharedMessageId = `${RUN_ID}-shared-outbound@example.com`;
+    await prisma.communication.createMany({
+      data: [
+        {
+          caseId,
+          direction: "OUTBOUND",
+          channel: "EMAIL",
+          status: "SENT",
+          provider: "ses",
+          providerId: `${sharedMessageId}-provider-a`,
+          messageId: sharedMessageId,
+          sentAt: new Date()
+        },
+        {
+          caseId: otherCaseId,
+          direction: "OUTBOUND",
+          channel: "EMAIL",
+          status: "SENT",
+          provider: "ses",
+          providerId: `${sharedMessageId}-provider-b`,
+          messageId: sharedMessageId,
+          sentAt: new Date()
+        }
+      ]
+    });
+
+    await expect(
+      new DebtorReplyService().process(
+        inboundEmail({
+          providerId: `${RUN_ID}-message-ambiguous-thread`,
+          to: ["collections@example.com"],
+          inReplyTo: `<${sharedMessageId}>`,
+          references: [`<${sharedMessageId}>`],
+          textBody: "Zaplatíme budúci týždeň."
+        })
+      )
+    ).resolves.toBeNull();
   });
 
   it("stores reply attachments once without treating them as payment proof", async () => {

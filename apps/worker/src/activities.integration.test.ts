@@ -214,8 +214,12 @@ describe("debtor clarification retry", () => {
       }
     });
     expect(notice.toAddress).toBe("customer-notice@example.com");
+    expect(notice.subject).toContain("potrebujeme rozhodnutie");
+    expect(notice.textBody).toContain("Prosím splátky po 25 EUR.");
+    expect(notice.textBody).toContain("Dlžník navrhol inú alebo čiastočnú sumu");
+    expect(notice.textBody).toContain("Môžete odpovedať priamo na tento email");
     expect(notice.rawPayload).toMatchObject({
-      kind: "customer-notice",
+      kind: "customer-debtor-reply-decision",
       replyTo: expect.stringMatching(
         new RegExp(`^clarify\\+${noticeCaseId}\\.[a-f0-9]+@fakturio\\.test$`)
       )

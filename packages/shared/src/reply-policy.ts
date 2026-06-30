@@ -16,7 +16,7 @@ export type ReplyPolicyInput = {
 };
 
 export type ReplyPolicyDecision =
-  | { kind: "IGNORE"; reason: "SENDER_MISMATCH" | "AUTOMATED_REPLY" | "OTHER" }
+  | { kind: "IGNORE"; reason: "AUTOMATED_REPLY" | "OTHER" }
   | { kind: "CHECK_PAYMENT_NOW" }
   | { kind: "KEEP_EXISTING_DEADLINE" }
   | { kind: "ACCEPT_PROMISE"; paymentDate: Date }
@@ -24,16 +24,19 @@ export type ReplyPolicyDecision =
   | { kind: "ACTIVATE_INSTALLMENT" }
   | { kind: "REJECT_INSTALLMENT" }
   | { kind: "PAUSE_DISPUTE" }
-  | { kind: "PAUSE_MANUAL_REVIEW"; reason: "AMOUNT_MISMATCH" }
+  | {
+      kind: "PAUSE_MANUAL_REVIEW";
+      reason: "AMOUNT_MISMATCH" | "SENDER_MISMATCH";
+    }
   | { kind: "REQUEST_CLARIFICATION" }
   | { kind: "PAUSE_UNCLEAR" };
 
 export function decideDebtorReply(input: ReplyPolicyInput): ReplyPolicyDecision {
-  if (!input.senderMatchesDebtor) {
-    return { kind: "IGNORE", reason: "SENDER_MISMATCH" };
-  }
   if (input.automated || input.classification.intent === "AUTOMATED_REPLY") {
     return { kind: "IGNORE", reason: "AUTOMATED_REPLY" };
+  }
+  if (!input.senderMatchesDebtor) {
+    return { kind: "PAUSE_MANUAL_REVIEW", reason: "SENDER_MISMATCH" };
   }
 
   if (

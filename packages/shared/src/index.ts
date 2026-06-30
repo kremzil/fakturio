@@ -1,6 +1,7 @@
 export * from "./invoice";
 export * from "./invoice-attachment-triage";
 export * from "./customer-message";
+export * from "./communication-kinds";
 export * from "./intake";
 export * from "./case-status";
 export * from "./validation";

@@ -4,6 +4,7 @@ import { createAiProvider } from "@fakturio/ai";
 import { prisma } from "@fakturio/db";
 import {
   buildClarificationRequest,
+  buildCustomerDebtorReplyDecisionRequest,
   buildCustomerExceptionNotice,
   buildDisputeAcknowledgement,
   buildExistingDeadlineReply,
@@ -865,17 +866,28 @@ async function applyReplyDecision(input: {
       buildDisputeAcknowledgement({ invoiceNumber }),
       "dispute-ack"
     );
-    await sendCustomerNotice(
-      collectionCase.id,
-      collectionCase.organizationId,
-      "Dlžník namieta faktúru",
-      classification.summary,
+    await sendCustomerDebtorReplyDecisionRequest(
+      collectionCase,
+      communication,
+      "Dlžník namieta faktúru. Automatizácia je pozastavená, kým rozhodnete, ako pokračovať.",
       `dispute-customer:${communication.id}`
     );
     return { kind: "PAUSED" };
   }
 
   if (decision.kind === "PAUSE_MANUAL_REVIEW") {
+    const notice =
+      decision.reason === "SENDER_MISMATCH"
+        ? {
+            reason:
+              "Odpoveď bola priradená k prípadu, ale odosielateľ sa nezhoduje s uloženým emailom dlžníka. Skontrolujte ju pred pokračovaním.",
+            idempotencyKey: `sender-mismatch-customer:${communication.id}`
+          }
+        : {
+            reason:
+              "Dlžník navrhol inú alebo čiastočnú sumu/podmienky. Automatizácia nemení výšku dlhu ani neakceptuje neštandardné podmienky bez vášho pokynu.",
+            idempotencyKey: `amount-mismatch-customer:${communication.id}`
+          };
     await pauseAutomation(
       collectionCase.id,
       collectionCase.status as CaseStatus,
@@ -884,12 +896,11 @@ async function applyReplyDecision(input: {
       classification.summary,
       "MANUAL_REVIEW_REQUIRED"
     );
-    await sendCustomerNotice(
-      collectionCase.id,
-      collectionCase.organizationId,
-      "Odpoveď vyžaduje manuálnu kontrolu",
-      "Dlžník uviedol čiastočnú alebo odlišnú sumu. Automatizácia ju neprijala.",
-      `amount-mismatch-customer:${communication.id}`
+    await sendCustomerDebtorReplyDecisionRequest(
+      collectionCase,
+      communication,
+      notice.reason,
+      notice.idempotencyKey
     );
     return { kind: "PAUSED" };
   }
@@ -916,11 +927,10 @@ async function applyReplyDecision(input: {
     communication.id,
     classification.summary
   );
-  await sendCustomerNotice(
-    collectionCase.id,
-    collectionCase.organizationId,
-    "Nejasná odpoveď dlžníka",
-    classification.summary,
+  await sendCustomerDebtorReplyDecisionRequest(
+    collectionCase,
+    communication,
+    "Odpoveď dlžníka je nejasná alebo opakovane neúplná. Prosíme, určite ďalší postup.",
     `unclear-customer:${communication.id}`
   );
   return { kind: "PAUSED" };
@@ -1200,6 +1210,56 @@ async function sendCustomerNotice(
     }),
     metadata: { caseId, organizationId, kind: "customer-notice" },
     rawPayload: { kind: "customer-notice", title, replyTo }
+  });
+}
+
+async function sendCustomerDebtorReplyDecisionRequest(
+  collectionCase: CollectionCase,
+  communication: {
+    id: string;
+    textBody: string | null;
+    htmlBody: string | null;
+  },
+  reason: string,
+  idempotencyKey: string
+): Promise<void> {
+  const recipient = await getCustomerCheckRecipient(
+    collectionCase.organizationId,
+    collectionCase.confirmedByUserId
+  );
+  if (!recipient) {
+    return;
+  }
+  const publicUrl =
+    process.env.NEXTAUTH_URL || process.env.APP_URL || "http://localhost:3000";
+  const replyTo = caseClarificationAddress(collectionCase.id);
+  const debtorMessage = truncateForCustomerEmail(
+    communication.textBody?.trim() || stripHtml(communication.htmlBody)
+  );
+  await sendTrackedEmail({
+    caseId: collectionCase.id,
+    idempotencyKey,
+    fromAddress: outboundFromAddress(),
+    toAddress: recipient,
+    replyTo,
+    template: buildCustomerDebtorReplyDecisionRequest({
+      invoiceNumber: collectionCase.invoiceNumber ?? collectionCase.id,
+      debtorName: collectionCase.debtor?.name ?? null,
+      debtorMessage,
+      reason,
+      caseUrl: `${publicUrl}/?case=${collectionCase.id}`
+    }),
+    metadata: {
+      caseId: collectionCase.id,
+      organizationId: collectionCase.organizationId,
+      kind: "customer-debtor-reply-decision"
+    },
+    rawPayload: {
+      kind: "customer-debtor-reply-decision",
+      replyTo,
+      sourceCommunicationId: communication.id,
+      reason
+    }
   });
 }
 
@@ -1798,6 +1858,14 @@ function normalizeMessageId(value: string | null | undefined): string | null {
 
 function stripHtml(value: string | null): string {
   return value?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() ?? "";
+}
+
+function truncateForCustomerEmail(value: string | null): string | null {
+  const cleaned = value?.replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return null;
+  }
+  return cleaned.length > 1200 ? `${cleaned.slice(0, 1200)}...` : cleaned;
 }
 
 function escapeHtml(value: string): string {

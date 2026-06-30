@@ -175,19 +175,62 @@ export class MockAiProvider implements AiProvider {
     }
 
     const hasFields = Object.values(fields).some((value) => value !== null);
+    const asksStart =
+      lower.includes("spusti") ||
+      lower.includes("potvrd") ||
+      lower.includes("start case") ||
+      lower.includes("запусти");
+    const asksStandardInstallment =
+      lower.includes("standard") ||
+      lower.includes("štandard") ||
+      lower.includes("summa/3") ||
+      lower.includes("сумма/3") ||
+      lower.includes("стандартн");
+    const asksCustomInstallment =
+      !asksStandardInstallment &&
+      (lower.includes("splatk") ||
+        lower.includes("splátk") ||
+        lower.includes("installment") ||
+        lower.includes("рассроч"));
+    const asksHistory =
+      lower.includes("histori") ||
+      lower.includes("ake kroky") ||
+      lower.includes("aké kroky") ||
+      lower.includes("co sa") ||
+      lower.includes("čo sa") ||
+      lower.includes("какие действия");
+    const asksDebtorMessage =
+      lower.includes("napíš") ||
+      lower.includes("napis") ||
+      lower.includes("pošli mu") ||
+      lower.includes("posli mu") ||
+      lower.includes("send debtor") ||
+      lower.includes("напиши должнику");
     const mutating = lower.includes("označ") || lower.includes("oznac") || lower.includes("cancel") || lower.includes("zastav") || lower.includes("pauz");
     const asksStatus = lower.includes("stav") || lower.includes("status");
 
+    const intent = asksStandardInstallment
+      ? "REQUEST_STANDARD_INSTALLMENT_PLAN"
+      : asksCustomInstallment
+        ? "REQUEST_CUSTOM_INSTALLMENT_PLAN"
+        : asksDebtorMessage
+          ? "REQUEST_SEND_DEBTOR_MESSAGE"
+          : asksHistory
+            ? "ASK_CASE_HISTORY"
+            : asksStart
+              ? "REQUEST_CONFIRM_INVOICE"
+              : mutating
+                ? lower.includes("uhraden") || lower.includes("paid")
+                  ? "REQUEST_MARK_PAID"
+                  : "REQUEST_PAUSE"
+                : hasFields
+                  ? "PROVIDE_INVOICE_FIELDS"
+                  : asksStatus
+                    ? "ASK_CASE_STATUS"
+                    : "ADD_CASE_NOTE";
+
     return {
-      intent: mutating
-        ? lower.includes("uhraden") || lower.includes("paid")
-          ? "REQUEST_MARK_PAID"
-          : "REQUEST_PAUSE"
-        : hasFields
-          ? "PROVIDE_INVOICE_FIELDS"
-          : asksStatus
-            ? "ASK_CASE_STATUS"
-            : "ADD_CASE_NOTE",
+      intent,
       confidence: 0.86,
       summary: input.messageText.slice(0, 240),
       extractedInvoiceFields: fields,
@@ -201,9 +244,12 @@ export class MockAiProvider implements AiProvider {
         debtorName: fields.debtorName
       },
       customerNote: hasFields ? null : input.messageText.slice(0, 500),
-      requestedAction: mutating ? input.messageText.slice(0, 240) : null,
+      requestedAction:
+        mutating || asksStart || asksStandardInstallment || asksCustomInstallment || asksDebtorMessage
+          ? input.messageText.slice(0, 240)
+          : null,
       needsHumanReview: false,
-      replyDraft: null
+      replyDraft: asksCustomInstallment || asksDebtorMessage ? input.messageText.slice(0, 500) : null
     };
   }
 

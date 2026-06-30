@@ -219,7 +219,7 @@ async function resolveInboundReplyCase(email: InboundEmail): Promise<{
     return null;
   }
 
-  const outbound = await prisma.communication.findFirst({
+  const outboundMatches = await prisma.communication.findMany({
     where: {
       direction: "OUTBOUND",
       OR: [
@@ -232,12 +232,15 @@ async function resolveInboundReplyCase(email: InboundEmail): Promise<{
         include: { debtor: true }
       }
     },
-    orderBy: { createdAt: "desc" }
+    orderBy: { createdAt: "desc" },
+    take: 2
   });
 
-  return outbound
-    ? summarizeMatch(outbound.case, "MESSAGE_THREAD")
-    : null;
+  if (outboundMatches.length !== 1) {
+    return null;
+  }
+
+  return summarizeMatch(outboundMatches[0].case, "MESSAGE_THREAD");
 }
 
 function summarizeMatch(
