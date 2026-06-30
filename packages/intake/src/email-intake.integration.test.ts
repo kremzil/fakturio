@@ -225,6 +225,88 @@ describe("email invoice intake idempotency", () => {
     expect(sent[1]?.textBody).toContain("/?case=");
   });
 
+  it("includes a start link after missing fields make the case ready", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-ready-after-fields-outbound@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Ready Debtor s.r.o.",
+        email: "ready-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        sourceType: "EMAIL",
+        status: "MANUAL_REVIEW_REQUIRED",
+        dueDate: new Date("2026-07-15T00:00:00.000Z"),
+        amountTotal: 480,
+        currency: "EUR",
+        debtorId: debtor.id,
+        warnings: ["Invoice number not visible"]
+      }
+    });
+    const classifyCustomerMessage = vi.fn(async () =>
+      customerClassification({
+        intent: "PROVIDE_INVOICE_FIELDS",
+        summary: "Customer provided the invoice number.",
+        extractedInvoiceFields: {
+          ...emptyFields(),
+          invoiceNumber: "FV-READY-1"
+        }
+      })
+    );
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(classifyCustomerMessage),
+      email: emailProvider
+    }).process({
+      provider: "ses",
+      providerId: `${RUN_ID}-ready-after-fields`,
+      messageId: `${RUN_ID}-ready-after-fields@example.com`,
+      inReplyTo: null,
+      references: [],
+      autoSubmitted: null,
+      precedence: null,
+      from: "client@example.com",
+      to: [
+        createCaseClarificationAddress(
+          { caseId: collectionCase.id, domain: "fakturio.test" },
+          requireInboundReplyTokenSecret()
+        )
+      ],
+      cc: [],
+      subject: "Re: missing invoice number",
+      textBody: "Číslo faktúry je FV-READY-1.",
+      htmlBody: null,
+      attachments: [],
+      raw: {}
+    });
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      status: "PARSED",
+      intent: "PROVIDE_INVOICE_FIELDS",
+      stillMissing: []
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.textBody).toContain("READY-1");
+    expect(sent[0]?.textBody).toContain("/confirm-link?token=");
+    expect(sent[0]?.textBody).toContain("/?case=");
+  });
+
   it("records customer action requests without mutating case status", async () => {
     const sent: SendEmailInput[] = [];
     const emailProvider: EmailProvider = {
@@ -673,6 +755,78 @@ describe("email invoice intake idempotency", () => {
     expect(sent[2]?.textBody).toContain("First reminder sent.");
   });
 
+  it("does not send legal-threat debtor messages and explains the block", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-legal-threat-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Legal Threat Debtor s.r.o.",
+        email: "legal-threat-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        debtorId: debtor.id,
+        sourceType: "EMAIL",
+        status: "EMAIL_REMINDER_1_SENT",
+        invoiceNumber: "FV-LEGAL-BLOCK",
+        dueDate: new Date("2026-06-01T00:00:00.000Z"),
+        amountTotal: 900,
+        currency: "EUR",
+        confirmedAt: new Date()
+      }
+    });
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async () =>
+        customerClassification({
+          intent: "REQUEST_SEND_DEBTOR_MESSAGE",
+          summary:
+            "Customer asks to send an additional message to the debtor threatening court action if they do not pay.",
+          requestedAction: "Send additional message to debtor",
+          customerNote: "Ak nezaplati - pojde na sud",
+          replyDraft: "Ak nezaplatí, pôjde na súd.",
+          needsHumanReview: true
+        })
+      ),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-legal-threat`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: rozhodnutie",
+        textBody:
+          "Pošlite mu doplňujúcu správu: Ak nezaplatí, pôjde na súd.",
+        attachments: []
+      })
+    );
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      intent: "REQUEST_SEND_DEBTOR_MESSAGE",
+      replySent: true
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.to).toEqual(["client@example.com"]);
+    expect(sent[0]?.textBody).toContain("správu dlžníkovi sme neodoslali");
+    expect(sent[0]?.textBody).toContain("Ak nezaplatí, pôjde na súd.");
+    expect(sent[0]?.textBody).toContain("právnu hrozbu");
+  });
+
   it("stores ambiguous alias emails in a manual-review container case", async () => {
     const sent: SendEmailInput[] = [];
     const emailProvider: EmailProvider = {
@@ -775,6 +929,101 @@ describe("email invoice intake idempotency", () => {
         where: { organizationId, sourceType: "EMAIL", invoiceNumber: { startsWith: "TRIAGE-" } }
       })
     ).toBeGreaterThanOrEqual(2);
+  });
+
+  it("sends a separate customer clarification for each split invoice that needs review", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-multi-separate-clarification-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const ai = multiAttachmentAi("SEPARATE_INVOICES");
+    let invoiceCounter = 0;
+    ai.extractInvoice.mockImplementation(async () => {
+      invoiceCounter += 1;
+      return {
+        invoiceNumber: null,
+        issueDate: null,
+        dueDate: "2026-07-15",
+        amountTotal: 100 + invoiceCounter,
+        currency: "EUR",
+        supplier: {
+          name: "ABC s.r.o.",
+          email: "client@example.com",
+          ico: null,
+          dic: null,
+          icDph: null,
+          address: null
+        },
+        debtor: {
+          name: `Debtor ${invoiceCounter} s.r.o.`,
+          email: `debtor-${invoiceCounter}@example.com`,
+          ico: null,
+          dic: null,
+          icDph: null,
+          address: null
+        },
+        payment: {
+          iban: null,
+          variableSymbol: null,
+          constantSymbol: null,
+          specificSymbol: null
+        },
+        subjectNote: null,
+        confidence: 0.91,
+        manualReviewRequired: false,
+        warnings: ["Invoice number not visible"],
+        rawResult: { invoiceCounter }
+      };
+    });
+    const service = new InvoiceIntakeService({ ai, storage, email: emailProvider });
+
+    const result = await service.createFromEmail({
+      organizationId,
+      email: inboundEmail({
+        providerId: `${RUN_ID}-multi-separate-needs-review`,
+        subject: "Two invoices need review",
+        from: "client@example.com",
+        attachments: [
+          attachment("invoice-needs-number-a.pdf", [11, 12, 13, 14]),
+          attachment("invoice-needs-number-b.pdf", [21, 22, 23, 24])
+        ]
+      })
+    });
+
+    expect(result.cases).toHaveLength(2);
+    expect(result.cases.map((item) => item.status)).toEqual([
+      "MANUAL_REVIEW_REQUIRED",
+      "MANUAL_REVIEW_REQUIRED"
+    ]);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]?.replyTo).toEqual([expect.stringMatching(/^clarify\+/)]);
+    expect(sent[1]?.replyTo).toEqual([expect.stringMatching(/^clarify\+/)]);
+    expect(sent[0]?.replyTo?.[0]).not.toEqual(sent[1]?.replyTo?.[0]);
+    expect(sent[0]?.subject).toContain("invoice-needs-number-a.pdf");
+    expect(sent[1]?.subject).toContain("invoice-needs-number-b.pdf");
+    expect(sent[0]?.textBody).toContain("Týka sa dokumentu: invoice-needs-number-a.pdf");
+    expect(sent[1]?.textBody).toContain("Týka sa dokumentu: invoice-needs-number-b.pdf");
+    expect(
+      await prisma.communication.count({
+        where: {
+          caseId: { in: result.cases.map((item) => item.caseId) },
+          direction: "OUTBOUND",
+          rawPayload: {
+            path: ["kind"],
+            equals: CUSTOMER_COMMUNICATION_KINDS.invoiceClarificationRequest
+          }
+        }
+      })
+    ).toBe(2);
   });
 
   it("keeps supporting documents on one case history", async () => {

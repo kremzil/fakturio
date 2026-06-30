@@ -119,7 +119,7 @@ type NavView =
   | "LEGAL"
   | "ARCHIVE";
 type DebtorFilterId = "ALL" | "ACTIVE" | "WITHOUT_EMAIL";
-type DetailTab = "OVERVIEW" | "TIMELINE" | "COMMUNICATIONS";
+type DetailTab = "OVERVIEW" | "TIMELINE" | "COMMUNICATIONS" | "ASSISTANT";
 type ToastKind = "success" | "error" | "info";
 type ToastMessage = {
   id: number;
@@ -144,6 +144,11 @@ type ReviewFormState = {
   variableSymbol: string;
 };
 type ReviewFieldErrors = Partial<Record<keyof ReviewFormState, string>>;
+type AssistantReplyState = {
+  intent: string | null;
+  subject: string | null;
+  textBody: string;
+};
 
 export function Dashboard({
   initialCases,
@@ -184,6 +189,11 @@ export function Dashboard({
     null
   );
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
+  const [assistantDraft, setAssistantDraft] = useState("");
+  const [assistantReply, setAssistantReply] = useState<AssistantReplyState | null>(
+    null
+  );
+  const [assistantPending, setAssistantPending] = useState(false);
 
   const filteredCases = useMemo(
     () => filterCases(cases, filter, deferredQuery),
@@ -213,6 +223,8 @@ export function Dashboard({
     setContactEmail(selected?.debtorEmail ?? "");
     setReviewDirty(false);
     setValidationErrors([]);
+    setAssistantDraft("");
+    setAssistantReply(null);
     setDetailTab("OVERVIEW");
   }, [selected]);
 
@@ -564,6 +576,45 @@ export function Dashboard({
     }
   }
 
+  async function sendAssistantMessage(messageOverride?: string) {
+    if (!selected) {
+      return;
+    }
+    const message = (messageOverride ?? assistantDraft).trim();
+    if (!message) {
+      notify("error", "Napíšte pokyn pre asistenta.");
+      return;
+    }
+    setAssistantPending(true);
+    clearToast();
+    try {
+      const response = await fetch(`/api/cases/${selected.id}/assistant`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message })
+      });
+      const payload = await readApiPayload(response);
+      if (!response.ok) {
+        notify("error", payload.error ?? "Asistent nedokázal spracovať pokyn.");
+        return;
+      }
+      replaceCase(payload.case);
+      setAssistantDraft("");
+      setAssistantReply({
+        intent: payload.assistant?.intent ?? null,
+        subject: payload.assistant?.reply?.subject ?? null,
+        textBody:
+          payload.assistant?.reply?.textBody ??
+          "Pokyn bol spracovaný. Detail prípadu bol aktualizovaný."
+      });
+      notify("success", "Asistent spracoval pokyn.");
+    } catch {
+      notify("error", "Asistent nedokázal spracovať pokyn. Skontrolujte pripojenie.");
+    } finally {
+      setAssistantPending(false);
+    }
+  }
+
   function notify(kind: ToastKind, text: string) {
     setToast({ id: Date.now(), kind, text });
   }
@@ -761,9 +812,19 @@ export function Dashboard({
                   />
                 ) : detailTab === "TIMELINE" ? (
                   <TimelinePanel events={selected.events} />
-                ) : (
+                ) : detailTab === "COMMUNICATIONS" ? (
                   <CommunicationsPanel
                     communications={selected.communications}
+                  />
+                ) : (
+                  <AssistantPanel
+                    item={selected}
+                    draft={assistantDraft}
+                    reply={assistantReply}
+                    pending={assistantPending}
+                    onDraftChange={setAssistantDraft}
+                    onSubmit={() => sendAssistantMessage()}
+                    onQuickCommand={(message) => sendAssistantMessage(message)}
                   />
                 )}
               </div>
@@ -1557,7 +1618,8 @@ function DetailTabs({
       id: "COMMUNICATIONS",
       label: "Komunikácia",
       count: item.communicationCount
-    }
+    },
+    { id: "ASSISTANT", label: "Asistent" }
   ];
   return (
     <div className="flex h-12 items-end gap-6 border-b border-zincLine px-6">
@@ -1957,6 +2019,136 @@ function CommunicationsPanel({
           />
         )}
       </div>
+    </div>
+  );
+}
+
+function AssistantPanel({
+  item,
+  draft,
+  reply,
+  pending,
+  onDraftChange,
+  onSubmit,
+  onQuickCommand
+}: {
+  item: DashboardCase;
+  draft: string;
+  reply: AssistantReplyState | null;
+  pending: boolean;
+  onDraftChange: (value: string) => void;
+  onSubmit: () => void;
+  onQuickCommand: (message: string) => void;
+}) {
+  const quickActions = [
+    {
+      label: "História prípadu",
+      icon: Clock3,
+      message: "Aké kroky boli v tomto prípade urobené?"
+    },
+    {
+      label: "Štandardné splátky",
+      icon: CalendarClock,
+      message: "Pošli dlžníkovi štandardný splátkový kalendár."
+    },
+    {
+      label: "Správa dlžníkovi",
+      icon: Mail,
+      message:
+        "Napíš dlžníkovi, že žiadame úhradu podľa pôvodných podmienok faktúry."
+    },
+    {
+      label: "Spustiť prípad",
+      icon: Check,
+      message: "Spusti prípad podľa aktuálnych údajov."
+    }
+  ];
+  const canUseDebtorActions = Boolean(item.debtorEmail);
+
+  return (
+    <div className="mx-auto max-w-4xl px-6 py-6">
+      <SectionTitle title="Asistent prípadu" icon={Mail} />
+
+      <div className="mt-5 grid gap-3 sm:grid-cols-2">
+        {quickActions.map((action) => {
+          const Icon = action.icon;
+          const disabled =
+            pending ||
+            (!canUseDebtorActions &&
+              ["Štandardné splátky", "Správa dlžníkovi"].includes(action.label));
+          return (
+            <button
+              key={action.label}
+              type="button"
+              disabled={disabled}
+              onClick={() => onQuickCommand(action.message)}
+              className="flex min-h-14 items-center gap-3 border border-zincLine bg-white px-4 py-3 text-left text-sm transition hover:border-ink disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Icon className="h-4 w-4 shrink-0 text-[#08736e]" />
+              <span className="font-medium">{action.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {!canUseDebtorActions ? (
+        <div className="mt-3 border border-[#e2bd78] bg-[#fff9ed] p-3 text-sm text-[#845112]">
+          Pri dlžníkovi chýba email. Správy dlžníkovi a splátkové návrhy budú
+          dostupné po doplnení kontaktu.
+        </div>
+      ) : null}
+
+      <div className="mt-5 border border-zincLine bg-white">
+        <label className="block p-4">
+          <span className="text-sm font-semibold">Pokyn pre asistenta</span>
+          <textarea
+            value={draft}
+            onChange={(event) => onDraftChange(event.target.value)}
+            rows={7}
+            maxLength={4000}
+            placeholder="Napríklad: Navrhni dlžníkovi prvú platbu 500 EUR a zvyšok v 3 rovnakých splátkach. Alebo: Čo sa v tomto prípade stalo?"
+            className="mt-3 w-full resize-y border border-zincLine px-3 py-2 text-sm leading-6 outline-none focus:border-ink"
+          />
+        </label>
+        <div className="flex items-center justify-between gap-3 border-t border-zincLine px-4 py-3">
+          <div className="text-xs text-steel">
+            Asistent pracuje s týmto prípadom a zapisuje komunikáciu do histórie.
+          </div>
+          <button
+            type="button"
+            disabled={pending || !draft.trim()}
+            onClick={onSubmit}
+            className="h-10 shrink-0 bg-ink px-4 text-sm text-white hover:bg-[#274039] disabled:opacity-50"
+          >
+            {pending ? "Spracúvam…" : "Odoslať"}
+          </button>
+        </div>
+      </div>
+
+      {reply ? (
+        <article className="mt-5 border border-zincLine bg-[#fafaf8] p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold">
+                {reply.subject ?? "Odpoveď asistenta"}
+              </div>
+              {reply.intent ? (
+                <div className="mt-1 text-xs text-steel">{reply.intent}</div>
+              ) : null}
+            </div>
+            <StatusBadge status={item.status} />
+          </div>
+          <p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-[#33413b]">
+            {reply.textBody}
+          </p>
+        </article>
+      ) : (
+        <EmptyPanel
+          icon={Mail}
+          title="Pripravený na pokyn"
+          text="Použite rýchlu akciu alebo napíšte vlastný pokyn k vybranému prípadu."
+        />
+      )}
     </div>
   );
 }

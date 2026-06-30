@@ -6,6 +6,7 @@ import {
   buildClarificationRequest,
   buildCustomerDebtorReplyDecisionRequest,
   buildCustomerExceptionNotice,
+  buildDebtorInvoiceCopy,
   buildDisputeAcknowledgement,
   buildExistingDeadlineReply,
   buildFirstReminderEmail,
@@ -34,6 +35,7 @@ import {
   type CaseStatus,
   type DebtorReplyClassification
 } from "@fakturio/shared";
+import { createStorageProvider } from "@fakturio/storage";
 import {
   FIRST_REMINDER_PAYMENT_TERM_DAYS,
   PAYMENT_CHECK_SEND_LEASE_MS,
@@ -126,6 +128,9 @@ export const activities: CaseWorkflowActivities = {
     let expectedStatuses: Array<typeof collectionCase.status>;
     let nextStatus: typeof collectionCase.status;
     let nextActionAt: Date | null;
+    let attachments:
+      | Array<{ fileName: string; contentType: string; content: Uint8Array }>
+      | undefined;
 
     if (input.reminderLevel === 1) {
       if (collectionCase.status !== "OVERDUE") {
@@ -151,6 +156,8 @@ export const activities: CaseWorkflowActivities = {
         variableSymbol: stringValue(payment.variableSymbol),
         subjectNote: collectionCase.subjectNote
       });
+      const originalInvoice = await loadOriginalInvoiceAttachment(collectionCase.id);
+      attachments = originalInvoice ? [originalInvoice] : undefined;
       expectedStatuses = ["OVERDUE"];
       nextStatus = "EMAIL_REMINDER_1_SENT";
     } else if (input.reminderLevel === 2) {
@@ -183,6 +190,7 @@ export const activities: CaseWorkflowActivities = {
       toAddress: recipient,
       replyTo,
       template,
+      attachments,
       metadata: {
         caseId: collectionCase.id,
         organizationId: collectionCase.organizationId,
@@ -192,7 +200,8 @@ export const activities: CaseWorkflowActivities = {
         kind: "debtor-reminder",
         reminderLevel: input.reminderLevel,
         replyTo,
-        nextActionAt: nextActionAt?.toISOString() ?? null
+        nextActionAt: nextActionAt?.toISOString() ?? null,
+        attachedInvoice: attachments?.[0]?.fileName ?? null
       },
       onConfirmed: async (tx, communicationId, provider) => {
         const changed = await tx.case.updateMany({
@@ -440,6 +449,13 @@ export const activities: CaseWorkflowActivities = {
         communication.fromAddress?.toLowerCase();
     const raw = jsonRecord(communication.rawPayload);
     const automated = isAutomatedRawEmail(raw);
+    if (!automated && senderMatchesDebtor && debtorAskedForInvoiceCopy(communication)) {
+      const sent = await sendDebtorInvoiceCopy(communication.case, communication);
+      return {
+        kind: sent ? "INVOICE_COPY_SENT" : "INVOICE_COPY_UNAVAILABLE",
+        communicationId: communication.id
+      };
+    }
     const proposedPlan = communication.case.installmentPlans[0] ?? null;
     const decision = decideDebtorReply({
       classification,
@@ -605,7 +621,9 @@ async function applyReplyDecision(input: {
     | "INSTALLMENT_ACTIVATED"
     | "INSTALLMENT_REJECTED"
     | "PAUSED"
-    | "CLARIFICATION_REQUESTED";
+    | "CLARIFICATION_REQUESTED"
+    | "INVOICE_COPY_SENT"
+    | "INVOICE_COPY_UNAVAILABLE";
 }> {
   const { communication, classification, decision } = input;
   const collectionCase = communication.case;
@@ -1172,6 +1190,54 @@ async function sendDebtorTemplate(
   });
 }
 
+async function sendDebtorInvoiceCopy(
+  collectionCase: Awaited<ReturnType<typeof loadReplyCommunication>>["case"],
+  communication: { id: string }
+): Promise<boolean> {
+  const recipient = collectionCase.debtor?.email?.trim();
+  if (!recipient) {
+    return false;
+  }
+  const attachment = await loadOriginalInvoiceAttachment(collectionCase.id);
+  if (!attachment) {
+    await recordReplyAction(
+      collectionCase.id,
+      communication.id,
+      "INVOICE_COPY_UNAVAILABLE",
+      "Debtor requested a copy of the invoice, but no original invoice document is stored."
+    );
+    return false;
+  }
+  await sendTrackedEmail({
+    caseId: collectionCase.id,
+    idempotencyKey: `debtor-response:invoice-copy:${communication.id}`,
+    fromAddress: outboundFromAddress(),
+    toAddress: recipient,
+    replyTo: caseReplyAddress(collectionCase.id),
+    template: buildDebtorInvoiceCopy({
+      invoiceNumber: collectionCase.invoiceNumber ?? collectionCase.id
+    }),
+    attachments: [attachment],
+    metadata: {
+      caseId: collectionCase.id,
+      organizationId: collectionCase.organizationId,
+      kind: "invoice-copy"
+    },
+    rawPayload: {
+      kind: "invoice-copy",
+      sourceCommunicationId: communication.id,
+      attachedInvoice: attachment.fileName
+    }
+  });
+  await recordReplyAction(
+    collectionCase.id,
+    communication.id,
+    "INVOICE_COPY_SENT",
+    `Original invoice ${attachment.fileName} sent to debtor on request.`
+  );
+  return true;
+}
+
 async function sendCustomerNotice(
   caseId: string,
   organizationId: string,
@@ -1399,6 +1465,7 @@ async function sendTrackedEmail(input: {
   toAddress: string;
   replyTo?: string;
   template: CollectionTemplate;
+  attachments?: Array<{ fileName: string; contentType: string; content: Uint8Array }>;
   metadata: Record<string, string>;
   rawPayload?: Prisma.InputJsonValue;
   onConfirmed?: (
@@ -1439,6 +1506,7 @@ async function sendTrackedEmail(input: {
       subject: input.template.subject,
       textBody: input.template.textBody,
       htmlBody: input.template.htmlBody,
+      attachments: input.attachments,
       metadata: input.metadata
     });
   } catch (error) {
@@ -1571,6 +1639,35 @@ async function loadCaseForCollection(caseId: string, organizationId: string) {
   return collectionCase;
 }
 
+async function loadOriginalInvoiceAttachment(caseId: string): Promise<{
+  fileName: string;
+  contentType: string;
+  content: Uint8Array;
+} | null> {
+  const document = await prisma.invoiceDocument.findFirst({
+    where: { caseId },
+    orderBy: { createdAt: "asc" },
+    select: {
+      storageBucket: true,
+      storageKey: true,
+      originalName: true,
+      mimeType: true
+    }
+  });
+  if (!document) {
+    return null;
+  }
+  const object = await createStorageProvider().getObject({
+    bucket: document.storageBucket,
+    key: document.storageKey
+  });
+  return {
+    fileName: document.originalName,
+    contentType: document.mimeType,
+    content: object.body
+  };
+}
+
 async function loadReplyCommunication(id: string) {
   return prisma.communication.findUniqueOrThrow({
     where: { id },
@@ -1610,6 +1707,33 @@ function replyCaseSummary(
         ].join("\n")
       : "No proposed installment plan."
   ].join("\n");
+}
+
+function debtorAskedForInvoiceCopy(input: {
+  textBody: string | null;
+  htmlBody: string | null;
+}): boolean {
+  const text = stripQuotedReply(
+    input.textBody?.trim() || stripHtml(input.htmlBody)
+  ).toLocaleLowerCase("sk");
+  if (!text) {
+    return false;
+  }
+  const asksToSend =
+    /\b(pošlite|poslite|pošli|posli|zašlite|zaslite|send|please send|пришлите|отправьте|пришли)\b/u.test(
+      text
+    );
+  const asksForCopy =
+    /\b(kópiu|kopiu|copy|pdf|dokument|document|faktúru|fakturu|invoice|счет|счёт|фактуру)\b/u.test(
+      text
+    );
+  return asksToSend && asksForCopy;
+}
+
+function stripQuotedReply(value: string): string {
+  return value
+    .split(/\n(?:>|dňa |po |on .*wrote:|от .*написал|вт,|ср,|чт,|пт,|сб,|вс,|пн,)/iu)[0]
+    ?.trim() ?? "";
 }
 
 function requireInvoiceEmailData(collectionCase: CollectionCase): void {

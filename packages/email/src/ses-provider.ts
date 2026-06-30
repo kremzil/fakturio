@@ -3,6 +3,7 @@ import {
   SendEmailCommand,
   type SendEmailCommandOutput
 } from "@aws-sdk/client-sesv2";
+import { Buffer } from "node:buffer";
 import { EmailProvider, InboundEmail, SendEmailInput, SentEmailResult } from "./types";
 import { extractRawMimeInput, parseMimeEmail } from "./mime";
 import { EmailProviderError, type EmailProviderErrorCode } from "./errors";
@@ -44,15 +45,7 @@ export class SesEmailProvider implements EmailProvider {
             CcAddresses: input.cc,
             BccAddresses: input.bcc
           },
-          Content: {
-            Simple: {
-              Subject: { Data: input.subject },
-              Body: {
-                Text: { Data: input.textBody },
-                Html: input.htmlBody ? { Data: input.htmlBody } : undefined
-              }
-            }
-          },
+          Content: buildSesContent(input),
           EmailTags: Object.entries(input.metadata ?? {}).map(([Name, Value]) => ({ Name, Value }))
         })
       );
@@ -70,6 +63,110 @@ export class SesEmailProvider implements EmailProvider {
     const { raw, providerId } = extractRawMimeInput(input);
     return parseMimeEmail(raw, "ses", providerId);
   }
+}
+
+function buildSesContent(input: SendEmailInput) {
+  if (input.attachments?.length) {
+    return {
+      Raw: {
+        Data: Buffer.from(buildRawMimeMessage(input))
+      }
+    };
+  }
+
+  return {
+    Simple: {
+      Subject: { Data: input.subject },
+      Body: {
+        Text: { Data: input.textBody },
+        Html: input.htmlBody ? { Data: input.htmlBody } : undefined
+      }
+    }
+  };
+}
+
+function buildRawMimeMessage(input: SendEmailInput): string {
+  const mixedBoundary = `fakturio-mixed-${randomMimeBoundary()}`;
+  const alternativeBoundary = `fakturio-alt-${randomMimeBoundary()}`;
+  const headers = [
+    `From: ${input.from}`,
+    `To: ${input.to.join(", ")}`,
+    input.cc?.length ? `Cc: ${input.cc.join(", ")}` : null,
+    input.replyTo?.length ? `Reply-To: ${input.replyTo.join(", ")}` : null,
+    `Subject: ${encodeMimeHeader(input.subject)}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/mixed; boundary="${mixedBoundary}"`
+  ].filter(Boolean);
+
+  const parts = [
+    ...headers,
+    "",
+    `--${mixedBoundary}`,
+    `Content-Type: multipart/alternative; boundary="${alternativeBoundary}"`,
+    "",
+    `--${alternativeBoundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    quotedPrintable(input.textBody),
+    "",
+    `--${alternativeBoundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    quotedPrintable(input.htmlBody ?? htmlFromText(input.textBody)),
+    "",
+    `--${alternativeBoundary}--`
+  ];
+
+  for (const attachment of input.attachments ?? []) {
+    parts.push(
+      "",
+      `--${mixedBoundary}`,
+      `Content-Type: ${attachment.contentType}; name="${escapeMimeParameter(attachment.fileName)}"`,
+      "Content-Transfer-Encoding: base64",
+      `Content-Disposition: attachment; filename="${escapeMimeParameter(attachment.fileName)}"`,
+      "",
+      chunkBase64(Buffer.from(attachment.content).toString("base64"))
+    );
+  }
+
+  parts.push("", `--${mixedBoundary}--`, "");
+  return parts.join("\r\n");
+}
+
+function randomMimeBoundary(): string {
+  return Math.random().toString(16).slice(2);
+}
+
+function encodeMimeHeader(value: string): string {
+  if (/^[\x20-\x7e]*$/.test(value)) {
+    return value;
+  }
+  return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+function escapeMimeParameter(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function quotedPrintable(value: string): string {
+  return Buffer.from(value, "utf8")
+    .toString("hex")
+    .replace(/([0-9a-f]{2})/gi, "=$1")
+    .replace(/(.{1,72})/g, "$1\r\n")
+    .trim();
+}
+
+function htmlFromText(value: string): string {
+  return `<pre>${value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")}</pre>`;
+}
+
+function chunkBase64(value: string): string {
+  return value.replace(/.{1,76}/g, "$&\r\n").trim();
 }
 
 function toSesEmailProviderError(error: unknown): unknown {

@@ -6,6 +6,7 @@ import {
   buildCustomerAmbiguousCaseFollowUp,
   buildCustomerAssistantAcknowledgement,
   buildCustomerCaseStatusReply,
+  buildCustomerDebtorMessageBlocked,
   buildCustomerManualReviewEscalation,
   buildCustomerMissingFieldsFollowUp,
   buildCustomerAuthorizedDebtorMessage,
@@ -57,6 +58,14 @@ export type CustomerEmailAssistantResult = {
   status: string | null;
   intent: string;
   replySent: boolean;
+  assistantReply: {
+    subject: string;
+    textBody: string;
+  } | null;
+};
+
+export type CustomerEmailAssistantProcessOptions = {
+  sendReply?: boolean;
 };
 
 type CustomerEmailAssistantDependencies = {
@@ -108,8 +117,10 @@ export class CustomerEmailAssistantService {
 
   async process(
     email: InboundEmail,
-    route?: EmailOrganizationRoute
+    route?: EmailOrganizationRoute,
+    options: CustomerEmailAssistantProcessOptions = {}
   ): Promise<CustomerEmailAssistantResult | null> {
+    const shouldSendReply = options.sendReply !== false;
     const matched = await resolveCustomerAssistantCase(email, route, this.deps.ai);
     if (!matched) {
       return null;
@@ -121,7 +132,8 @@ export class CustomerEmailAssistantService {
         email,
         organizationId: matched.organizationId,
         matchedAddress: matched.matchedAddress,
-        reason: matched.reason
+        reason: matched.reason,
+        sendReply: shouldSendReply
       });
       return {
         caseId: unmatched.caseId,
@@ -132,7 +144,8 @@ export class CustomerEmailAssistantService {
         stillMissing: [],
         status: "MANUAL_REVIEW_REQUIRED",
         intent: "OTHER",
-        replySent: unmatched.replySent
+        replySent: unmatched.replySent,
+        assistantReply: unmatched.reply
       };
     }
 
@@ -151,7 +164,8 @@ export class CustomerEmailAssistantService {
         stillMissing: [],
         status: existing.case.status,
         intent: stringValue(jsonRecord(existing.aiClassification).intent) ?? "OTHER",
-        replySent: false
+        replySent: false,
+        assistantReply: null
       };
     }
 
@@ -189,14 +203,16 @@ export class CustomerEmailAssistantService {
           stillMissing: [],
           dashboardUrl: dashboardUrl(collectionCase.id)
         });
-        await sendAssistantReply({
-          deps: this.deps,
-          caseId: collectionCase.id,
-          inboundCommunicationId: multiAttachmentClarification.communicationId,
-          to: email.from,
-          template,
-          idempotencyKey: `customer-multi-attachment-resolved-reply:${email.provider}:${email.providerId}`
-        });
+        if (shouldSendReply) {
+          await sendAssistantReply({
+            deps: this.deps,
+            caseId: collectionCase.id,
+            inboundCommunicationId: multiAttachmentClarification.communicationId,
+            to: email.from,
+            template,
+            idempotencyKey: `customer-multi-attachment-resolved-reply:${email.provider}:${email.providerId}`
+          });
+        }
       }
 
       return {
@@ -208,7 +224,18 @@ export class CustomerEmailAssistantService {
         stillMissing: [],
         status: multiAttachmentClarification.status,
         intent: "PROVIDE_INVOICE_FIELDS",
-        replySent: true
+        replySent: shouldSendReply,
+        assistantReply: multiAttachmentClarification.stillNeedsClarification
+          ? null
+          : templateReply(buildCustomerAssistantAcknowledgement({
+              invoiceNumber: collectionCase.invoiceNumber,
+              summary:
+                multiAttachmentClarification.caseIds.length > 1
+                  ? "Dokumenty sme rozdelili a začali spracovanie jednotlivých faktúr."
+                  : "Dokumenty sme priradili k jednej faktúre a začali spracovanie.",
+              stillMissing: [],
+              dashboardUrl: dashboardUrl(collectionCase.id)
+            }))
       };
     }
 
@@ -338,15 +365,22 @@ export class CustomerEmailAssistantService {
         result.stillMissing,
         actionResult
       );
-      await sendAssistantReply({
-        deps: this.deps,
-        caseId: afterAction.id,
-        inboundCommunicationId: result.communicationId,
-        to: email.from,
-        template,
-        idempotencyKey: `customer-assistant-reply:${email.provider}:${email.providerId}`
-      });
-      return { ...result, status: afterAction.status, replySent: true };
+      if (shouldSendReply) {
+        await sendAssistantReply({
+          deps: this.deps,
+          caseId: afterAction.id,
+          inboundCommunicationId: result.communicationId,
+          to: email.from,
+          template,
+          idempotencyKey: `customer-assistant-reply:${email.provider}:${email.providerId}`
+        });
+      }
+      return {
+        ...result,
+        status: afterAction.status,
+        replySent: shouldSendReply,
+        assistantReply: templateReply(template)
+      };
     });
   }
 }
@@ -1199,6 +1233,19 @@ function chooseCustomerAssistantReply(
   }
 
   if (actionResult.kind === "ACTION_BLOCKED") {
+    if (classification.intent === "REQUEST_SEND_DEBTOR_MESSAGE") {
+      const requestedMessage =
+        cleanText(classification.replyDraft) ??
+        cleanText(classification.customerNote) ??
+        cleanText(classification.requestedAction) ??
+        classification.summary;
+      return buildCustomerDebtorMessageBlocked({
+        invoiceNumber: collectionCase.invoiceNumber,
+        requestedMessage,
+        reason: legalOrSafetyBlockReason(classification),
+        dashboardUrl: dashboardUrl(collectionCase.id)
+      });
+    }
     return buildCustomerActionNeedsConfirmation({
       invoiceNumber: collectionCase.invoiceNumber,
       requestedAction: actionResult.reason,
@@ -1207,6 +1254,19 @@ function chooseCustomerAssistantReply(
   }
 
   if (!isSafeToApply(classification)) {
+    if (classification.intent === "REQUEST_SEND_DEBTOR_MESSAGE") {
+      const requestedMessage =
+        cleanText(classification.replyDraft) ??
+        cleanText(classification.customerNote) ??
+        cleanText(classification.requestedAction) ??
+        classification.summary;
+      return buildCustomerDebtorMessageBlocked({
+        invoiceNumber: collectionCase.invoiceNumber,
+        requestedMessage,
+        reason: legalOrSafetyBlockReason(classification),
+        dashboardUrl: dashboardUrl(collectionCase.id)
+      });
+    }
     if (MUTATING_INTENTS.has(classification.intent)) {
       return buildCustomerActionNeedsConfirmation({
         invoiceNumber: collectionCase.invoiceNumber,
@@ -1254,6 +1314,26 @@ function chooseCustomerAssistantReply(
     });
   }
 
+  const shouldOfferStartAfterUpdate =
+    stillMissing.length === 0 &&
+    (classification.intent === "PROVIDE_INVOICE_FIELDS" ||
+      classification.intent === "UPDATE_DEBTOR_CONTACT");
+  if (shouldOfferStartAfterUpdate) {
+    const readyConfirmUrl = buildConfirmUrlIfReady(collectionCase);
+    if (readyConfirmUrl) {
+      return buildCustomerCaseStatusReply({
+        invoiceNumber: collectionCase.invoiceNumber,
+        status: collectionCase.status,
+        amountTotal: collectionCase.amountTotal ? Number(collectionCase.amountTotal) : null,
+        currency: collectionCase.currency,
+        dueDate: collectionCase.dueDate?.toISOString().slice(0, 10) ?? null,
+        debtorName: collectionCase.debtor?.name ?? null,
+        confirmUrl: readyConfirmUrl,
+        dashboardUrl: dashboardUrl(collectionCase.id)
+      });
+    }
+  }
+
   if (customerAskedForReviewEmail(classification)) {
     return buildCustomerCaseStatusReply({
       invoiceNumber: collectionCase.invoiceNumber,
@@ -1280,6 +1360,30 @@ function chooseCustomerAssistantReply(
     stillMissing,
     dashboardUrl: dashboardUrl(collectionCase.id)
   });
+}
+
+function legalOrSafetyBlockReason(
+  classification: CustomerMessageClassification
+): string {
+  const text = [
+    classification.summary,
+    classification.requestedAction,
+    classification.customerNote,
+    classification.replyDraft
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLocaleLowerCase("sk");
+  if (
+    text.includes("súd") ||
+    text.includes("sud") ||
+    text.includes("court") ||
+    text.includes("legal") ||
+    text.includes("práv")
+  ) {
+    return "Požiadavka obsahuje právnu hrozbu alebo odkaz na súdne vymáhanie.";
+  }
+  return "Požiadavka bola označená na manuálnu kontrolu bezpečnostnou politikou.";
 }
 
 function buildConfirmUrlIfReady(collectionCase: {
@@ -1471,17 +1575,29 @@ async function sendAssistantReply(input: {
   ]);
 }
 
+function templateReply(template: ReturnType<typeof buildCustomerAssistantAcknowledgement>) {
+  return {
+    subject: template.subject,
+    textBody: template.textBody
+  };
+}
+
 async function sendUnmatchedFollowUp(input: {
   deps: CustomerEmailAssistantDependencies;
   email: InboundEmail;
   organizationId: string;
   matchedAddress: string | null;
   reason: string;
+  sendReply?: boolean;
 }): Promise<{
   caseId: string;
   communicationId: string;
   duplicate: boolean;
   replySent: boolean;
+  reply: {
+    subject: string;
+    textBody: string;
+  };
 }> {
   const inboundIdempotencyKey = `customer-assistant-unmatched-inbound:${input.email.provider}:${input.email.providerId}`;
   const existing = await prisma.communication.findUnique({
@@ -1551,19 +1667,22 @@ async function sendUnmatchedFollowUp(input: {
   const template = buildCustomerAmbiguousCaseFollowUp({
     matchedAddress: input.matchedAddress
   });
-  await sendAssistantReply({
-    deps: input.deps,
-    caseId: stored.caseId,
-    inboundCommunicationId: stored.id,
-    to: input.email.from,
-    template,
-    idempotencyKey: `customer-assistant-unmatched-reply:${input.email.provider}:${input.email.providerId}`
-  });
+  if (input.sendReply !== false) {
+    await sendAssistantReply({
+      deps: input.deps,
+      caseId: stored.caseId,
+      inboundCommunicationId: stored.id,
+      to: input.email.from,
+      template,
+      idempotencyKey: `customer-assistant-unmatched-reply:${input.email.provider}:${input.email.providerId}`
+    });
+  }
   return {
     caseId: stored.caseId,
     communicationId: stored.id,
     duplicate: Boolean(existing),
-    replySent: true
+    replySent: input.sendReply !== false,
+    reply: templateReply(template)
   };
 }
 

@@ -55,7 +55,9 @@ export type DebtorReplyActionResult = {
     | "INSTALLMENT_ACTIVATED"
     | "INSTALLMENT_REJECTED"
     | "PAUSED"
-    | "CLARIFICATION_REQUESTED";
+    | "CLARIFICATION_REQUESTED"
+    | "INVOICE_COPY_SENT"
+    | "INVOICE_COPY_UNAVAILABLE";
   communicationId: string;
 };
 

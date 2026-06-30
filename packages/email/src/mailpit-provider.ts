@@ -27,7 +27,12 @@ export class MailpitEmailProvider implements EmailProvider {
       bcc: input.bcc,
       subject: input.subject,
       text: input.textBody,
-      html: input.htmlBody
+      html: input.htmlBody,
+      attachments: input.attachments?.map((attachment) => ({
+        filename: attachment.fileName,
+        contentType: attachment.contentType,
+        content: Buffer.from(attachment.content)
+      }))
     });
 
     return {

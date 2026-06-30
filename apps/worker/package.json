@@ -13,6 +13,7 @@
     "@fakturio/db": "0.2.0",
     "@fakturio/email": "0.2.0",
     "@fakturio/shared": "0.2.0",
+    "@fakturio/storage": "0.2.0",
     "@fakturio/workflows": "0.2.0"
   }
 }

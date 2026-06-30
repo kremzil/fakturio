@@ -7,7 +7,14 @@ export type SendEmailInput = {
   subject: string;
   textBody: string;
   htmlBody?: string;
+  attachments?: SendEmailAttachment[];
   metadata?: Record<string, string>;
+};
+
+export type SendEmailAttachment = {
+  fileName: string;
+  contentType: string;
+  content: Uint8Array;
 };
 
 export type SentEmailResult = {

@@ -12,6 +12,18 @@ export type CollectionTemplate = {
   htmlBody: string;
 };
 
+export type InvoiceEmailSummary = {
+  sourceDocumentName?: string | null;
+  invoiceNumber?: string | null;
+  supplierName?: string | null;
+  debtorName?: string | null;
+  amountTotal?: number | null;
+  currency?: string | null;
+  dueDate?: string | Date | null;
+  iban?: string | null;
+  variableSymbol?: string | null;
+};
+
 export function buildNeutralPaymentReply(input: {
   invoiceNumber: string;
   paymentDate: string;
@@ -207,6 +219,22 @@ export function buildCustomerAuthorizedDebtorMessage(input: {
   );
 }
 
+export function buildDebtorInvoiceCopy(input: {
+  invoiceNumber: string;
+}): CollectionTemplate {
+  return template(
+    `Kópia faktúry ${input.invoiceNumber}`,
+    [
+      "Dobrý deň,",
+      "",
+      `v prílohe posielame kópiu faktúry ${input.invoiceNumber}.`,
+      "Prosíme, odpovedzte priamo na tento email, ak potrebujete doplniť ďalšie informácie.",
+      "",
+      "Ďakujeme."
+    ]
+  );
+}
+
 export function buildCustomerExceptionNotice(input: {
   invoiceNumber: string;
   title: string;
@@ -262,25 +290,52 @@ export function buildCustomerDebtorReplyDecisionRequest(input: {
 
 export function buildCustomerInvoiceClarificationRequest(input: {
   invoiceNumber: string | null;
+  sourceDocumentName?: string | null;
+  invoiceData?: InvoiceEmailSummary | null;
   missingFields: string[];
   warnings: string[];
 }): CollectionTemplate {
-  const reference = input.invoiceNumber || "novej faktúre";
+  const sourceDocumentName = input.sourceDocumentName?.trim() || null;
+  const invoiceData = {
+    ...(input.invoiceData ?? {}),
+    sourceDocumentName: input.invoiceData?.sourceDocumentName ?? sourceDocumentName,
+    invoiceNumber: input.invoiceData?.invoiceNumber ?? input.invoiceNumber
+  };
+  const reference = input.invoiceNumber
+    ? `faktúre ${input.invoiceNumber}`
+    : sourceDocumentName
+      ? `dokumentu ${sourceDocumentName}`
+      : "novej faktúre";
   const missing =
     input.missingFields.length > 0
       ? input.missingFields
       : ["údaje označené v aplikácii ako nejasné"];
+  const contextLines = sourceDocumentName
+    ? ["", `Týka sa dokumentu: ${sourceDocumentName}`]
+    : [];
   const warningLines =
     input.warnings.length > 0
       ? ["", "Poznámky z automatického spracovania:", ...input.warnings.map((item) => `- ${item}`)]
       : [];
+  const subjectReference =
+    sourceDocumentName && input.invoiceNumber
+      ? `${reference} (${sourceDocumentName})`
+      : reference;
+  const invoiceLines = invoiceSummaryTextLines(invoiceData);
 
   return template(
-    `FAKTURIO: potrebujeme doplniť údaje k ${reference}`,
+    `FAKTURIO: potrebujeme doplniť údaje k ${subjectReference}`,
     [
       "Dobrý deň,",
       "",
       `pri spracovaní ${reference} sa nepodarilo spoľahlivo načítať všetky údaje potrebné na založenie prípadu.`,
+      ...contextLines,
+      "",
+      "Načítané údaje z faktúry:",
+      ...invoiceLines,
+      "",
+      "Chýbajúce povinné údaje:",
+      ...missing.map((field) => `! ${field}`),
       "",
       "Prosíme, odpovedzte na tento email a doplňte:",
       ...missing.map((field) => `- ${field}`),
@@ -298,7 +353,28 @@ export function buildCustomerInvoiceClarificationRequest(input: {
       "--- KONIEC PRÍKLADU ---",
       "",
       "Ďakujeme."
-    ]
+    ],
+    {
+      afterParagraph: 2,
+      bodyHtml: [
+        renderInvoiceSummaryTable(invoiceData, missing),
+        renderMissingFieldsBox(missing)
+      ].join(""),
+      skipHtmlPrefixes: [
+        "Týka sa dokumentu:",
+        "Načítané údaje z faktúry:",
+        "Chýbajúce povinné údaje:",
+        "- Dokument:",
+        "- Číslo faktúry:",
+        "- Dodávateľ:",
+        "- Odberateľ:",
+        "- Suma:",
+        "- Splatnosť:",
+        "- IBAN:",
+        "- Variabilný symbol:",
+        "! "
+      ]
+    }
   );
 }
 
@@ -423,6 +499,35 @@ export function buildCustomerActionNeedsConfirmation(input: {
   );
 }
 
+export function buildCustomerDebtorMessageBlocked(input: {
+  invoiceNumber: string | null;
+  requestedMessage: string;
+  reason: string;
+  dashboardUrl?: string | null;
+}): CollectionTemplate {
+  const reference = input.invoiceNumber || "prípadu";
+  return template(
+    `FAKTURIO: správu k ${reference} sme neodoslali`,
+    [
+      "Dobrý deň,",
+      "",
+      "správu dlžníkovi sme neodoslali automaticky.",
+      "",
+      "Požadované znenie:",
+      `„${input.requestedMessage}“`,
+      "",
+      "Dôvod:",
+      input.reason,
+      "",
+      "FAKTURIO môže odosielať iba schválené neutrálne výzvy a pripomienky. Pri textoch o súde, právnych následkoch alebo iných právnych krokoch je potrebná manuálna kontrola a schválené znenie.",
+      "Môžete odpovedať napríklad: pošlite schválenú druhú pripomienku, alebo upravte text bez právnej hrozby.",
+      input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
+      "",
+      "Ďakujeme."
+    ].filter((line) => line !== "")
+  );
+}
+
 export function buildCustomerManualReviewEscalation(input: {
   invoiceNumber: string | null;
   summary: string;
@@ -461,6 +566,13 @@ export function buildCustomerCaseStatusReply(input: {
       ? formatEmailMoney(input.amountTotal, input.currency)
       : "nezadaná";
   const dueDate = input.dueDate ? formatEmailDate(input.dueDate) : "nezadaná";
+  const invoiceData: InvoiceEmailSummary = {
+    invoiceNumber: input.invoiceNumber,
+    debtorName: input.debtorName,
+    amountTotal: input.amountTotal,
+    currency: input.currency,
+    dueDate: input.dueDate
+  };
   return template(
     `FAKTURIO: stav ${reference}`,
     [
@@ -480,16 +592,130 @@ export function buildCustomerCaseStatusReply(input: {
       input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    {
+      afterParagraph: 1,
+      bodyHtml: renderInvoiceSummaryTable(invoiceData),
+      skipHtmlPrefixes: [
+        "Faktúra:",
+        "Dlžník:",
+        "Suma:",
+        "Splatnosť:"
+      ]
+    }
   );
 }
 
-function template(subject: string, lines: string[]): CollectionTemplate {
+function template(
+  subject: string,
+  lines: string[],
+  options?: { afterParagraph?: number; bodyHtml?: string; skipHtmlPrefixes?: string[] }
+): CollectionTemplate {
   const textBody = lines.join("\n");
+  let paragraphIndex = 0;
   const bodyHtml = lines
-    .map((line) => (line ? `<p>${escapeHtml(line)}</p>` : "<br />"))
+    .map((line) => {
+      if (!line) {
+        return "<br />";
+      }
+      if (options?.skipHtmlPrefixes?.some((prefix) => line.startsWith(prefix))) {
+        return "";
+      }
+      const paragraph = `<p>${escapeHtml(line)}</p>`;
+      paragraphIndex += 1;
+      if (options?.bodyHtml && paragraphIndex === options.afterParagraph) {
+        return `${paragraph}${options.bodyHtml}`;
+      }
+      return paragraph;
+    })
     .join("");
   const preheader = lines.find((line) => line.trim().length > 0) ?? subject;
   const htmlBody = renderEmailDocument({ title: subject, preheader, bodyHtml });
   return { subject, textBody, htmlBody };
+}
+
+function invoiceSummaryTextLines(input: InvoiceEmailSummary): string[] {
+  return invoiceSummaryRows(input).map((row) => `- ${row.label}: ${row.value}`);
+}
+
+function invoiceSummaryRows(input: InvoiceEmailSummary): Array<{
+  label: string;
+  value: string;
+  missingKey?: string;
+}> {
+  const amount =
+    input.amountTotal !== null && input.amountTotal !== undefined
+      ? formatEmailMoney(input.amountTotal, input.currency)
+      : "nezadaná";
+  const dueDate = input.dueDate ? formatEmailDate(input.dueDate) : "nezadaná";
+  return [
+    { label: "Dokument", value: input.sourceDocumentName || "nezadaný" },
+    { label: "Číslo faktúry", value: input.invoiceNumber || "nezadané", missingKey: "invoiceNumber" },
+    { label: "Dodávateľ", value: input.supplierName || "nezadaný" },
+    { label: "Odberateľ", value: input.debtorName || "nezadaný", missingKey: "debtorName" },
+    { label: "Suma", value: amount, missingKey: "amountTotal" },
+    { label: "Splatnosť", value: dueDate, missingKey: "dueDate" },
+    { label: "IBAN", value: input.iban || "nezadaný" },
+    { label: "Variabilný symbol", value: input.variableSymbol || "nezadaný" }
+  ];
+}
+
+function renderInvoiceSummaryTable(
+  input: InvoiceEmailSummary,
+  missingFields: string[] = []
+): string {
+  const missingText = missingFields.join(" ").toLocaleLowerCase("sk");
+  const isMissing = (row: { missingKey?: string; value: string }) => {
+    if (!row.missingKey || !row.value.startsWith("nezadan")) {
+      return false;
+    }
+    if (row.missingKey === "invoiceNumber") {
+      return missingText.includes("číslo") || missingText.includes("cislo");
+    }
+    if (row.missingKey === "debtorName") {
+      return missingText.includes("odberateľ") || missingText.includes("dlžník") || missingText.includes("dlznik");
+    }
+    if (row.missingKey === "amountTotal") {
+      return missingText.includes("suma") || missingText.includes("úhradu") || missingText.includes("uhradu");
+    }
+    if (row.missingKey === "dueDate") {
+      return missingText.includes("splat");
+    }
+    return false;
+  };
+  const rows = invoiceSummaryRows(input)
+    .map((row) => {
+      const missing = isMissing(row);
+      const valueStyle = missing ? "color:#8a4b00;font-weight:700" : "color:#1d1d1b;font-weight:700";
+      const rowStyle = missing ? "background:#fff7e8" : "background:#ffffff";
+      return [
+        `<tr style="${rowStyle}">`,
+        `<td style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;width:38%">${escapeHtml(row.label)}</td>`,
+        `<td style="border:1px solid #d9ddd5;padding:8px 10px;${valueStyle}">${escapeHtml(row.value)}</td>`,
+        "</tr>"
+      ].join("");
+    })
+    .join("");
+  return [
+    '<div style="margin:18px 0">',
+    '<p style="margin:0 0 8px;font-weight:700">Načítané údaje z faktúry</p>',
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px">',
+    rows,
+    "</table>",
+    "</div>"
+  ].join("");
+}
+
+function renderMissingFieldsBox(missingFields: string[]): string {
+  if (missingFields.length === 0) {
+    return "";
+  }
+  return [
+    '<div style="margin:18px 0;padding:12px 14px;border:1px solid #e6a23c;background:#fff7e8">',
+    '<p style="margin:0 0 8px;color:#7a3f00;font-weight:700">Chýbajúce povinné údaje</p>',
+    '<ul style="margin:0;padding-left:20px;color:#7a3f00">',
+    ...missingFields.map((field) => `<li>${escapeHtml(field)}</li>`),
+    "</ul>",
+    "</div>"
+  ].join("");
 }

@@ -529,6 +529,18 @@ export class InvoiceIntakeService {
           caseId: collectionCase.id,
           customerEmail: input.email.from,
           invoiceNumber: parsed.invoiceNumber,
+          sourceDocumentName: input.file.fileName,
+          invoiceData: {
+            sourceDocumentName: input.file.fileName,
+            invoiceNumber: parsed.invoiceNumber,
+            supplierName: parsed.supplier.name,
+            debtorName: parsed.debtor.name,
+            amountTotal: parsed.amountTotal,
+            currency: parsed.currency ?? validation.currencyPatch,
+            dueDate: parsed.dueDate,
+            iban: parsed.payment.iban,
+            variableSymbol: parsed.payment.variableSymbol
+          },
           missingFields: validation.errors,
           warnings,
           idempotencyKey: `customer-clarification-request:${input.email.provider}:${input.email.providerId}:${collectionCase.id}`
@@ -557,6 +569,7 @@ export class InvoiceIntakeService {
           caseId: collectionCase.id,
           customerEmail: input.email.from,
           invoiceNumber: null,
+          sourceDocumentName: input.file.fileName,
           missingFields: ["údaje potrebné na spracovanie faktúry"],
           warnings: ["Automatické načítanie zlyhalo. Doplňte údaje manuálne."],
           idempotencyKey: `customer-clarification-request:${input.email.provider}:${input.email.providerId}:${collectionCase.id}`
@@ -862,6 +875,18 @@ export class InvoiceIntakeService {
     caseId: string;
     customerEmail: string | null;
     invoiceNumber: string | null;
+    sourceDocumentName?: string | null;
+    invoiceData?: {
+      sourceDocumentName?: string | null;
+      invoiceNumber?: string | null;
+      supplierName?: string | null;
+      debtorName?: string | null;
+      amountTotal?: number | null;
+      currency?: string | null;
+      dueDate?: string | null;
+      iban?: string | null;
+      variableSymbol?: string | null;
+    };
     missingFields: string[];
     warnings: string[];
     idempotencyKey: string;
@@ -881,6 +906,8 @@ export class InvoiceIntakeService {
 
     const template = buildCustomerInvoiceClarificationRequest({
       invoiceNumber: input.invoiceNumber,
+      sourceDocumentName: input.sourceDocumentName,
+      invoiceData: input.invoiceData,
       missingFields: input.missingFields,
       warnings: input.warnings
     });
@@ -907,6 +934,7 @@ export class InvoiceIntakeService {
           rawPayload: {
             kind: CUSTOMER_COMMUNICATION_KINDS.invoiceClarificationRequest,
             replyTo,
+            sourceDocumentName: input.sourceDocumentName ?? null,
             missingFields: input.missingFields
           }
         },
