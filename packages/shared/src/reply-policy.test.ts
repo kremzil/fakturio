@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  calculateCustomInstallmentSchedule,
   calculateInstallmentSchedule,
   decideDebtorReply
 } from "./reply-policy";
@@ -202,9 +203,43 @@ describe("debtor reply policy", () => {
     expect(
       decideDebtorReply({
         ...base,
+        hasProposedInstallmentPlan: true,
+        classification: classification({
+          intent: "INSTALLMENT_REQUEST",
+          requestedInstallmentCount: 5
+        })
+      })
+    ).toEqual({
+      kind: "PAUSE_MANUAL_REVIEW",
+      reason: "NON_STANDARD_INSTALLMENT_TERMS"
+    });
+    expect(
+      decideDebtorReply({
+        ...base,
         classification: classification({ intent: "INSTALLMENT_REJECTED" })
       })
     ).toEqual({ kind: "REJECT_INSTALLMENT" });
+  });
+
+  it("pauses a non-standard installment request before proposing a plan", () => {
+    expect(
+      decideDebtorReply({
+        classification: classification({
+          intent: "INSTALLMENT_REQUEST",
+          requestedInstallmentCount: 5
+        }),
+        senderMatchesDebtor: true,
+        automated: false,
+        clarificationCount: 0,
+        promiseExtensionUsed: false,
+        receivedAt,
+        hasProposedInstallmentPlan: false,
+        expectedAmount: 100
+      })
+    ).toEqual({
+      kind: "PAUSE_MANUAL_REVIEW",
+      reason: "NON_STANDARD_INSTALLMENT_TERMS"
+    });
   });
 });
 
@@ -228,6 +263,47 @@ describe("installment schedule", () => {
       }
     ]);
   });
+
+  it("creates custom installment schedules", () => {
+    expect(
+      calculateCustomInstallmentSchedule(1000, receivedAt, {
+        paymentCount: 5
+      })
+    ).toEqual([
+      {
+        sequence: 1,
+        amount: 200,
+        dueDate: new Date("2026-06-16T00:00:00.000Z")
+      },
+      {
+        sequence: 2,
+        amount: 200,
+        dueDate: new Date("2026-06-30T00:00:00.000Z")
+      },
+      {
+        sequence: 3,
+        amount: 200,
+        dueDate: new Date("2026-07-14T00:00:00.000Z")
+      },
+      {
+        sequence: 4,
+        amount: 200,
+        dueDate: new Date("2026-07-28T00:00:00.000Z")
+      },
+      {
+        sequence: 5,
+        amount: 200,
+        dueDate: new Date("2026-08-11T00:00:00.000Z")
+      }
+    ]);
+
+    expect(
+      calculateCustomInstallmentSchedule(1000, receivedAt, {
+        paymentCount: 4,
+        firstPaymentAmount: 500
+      }).map((payment) => payment.amount)
+    ).toEqual([500, 166.66, 166.66, 166.68]);
+  });
 });
 
 function classification(
@@ -244,6 +320,7 @@ function classification(
       | "IGNORE_OR_OTHER";
     promisedPaymentDate: string | null;
     explicitInstallmentAcceptance: boolean;
+    requestedInstallmentCount: number | null;
     mentionedPaymentAmount: number | null;
     confidence: number;
   }>
@@ -254,6 +331,7 @@ function classification(
     installmentRequested: overrides.intent === "INSTALLMENT_REQUEST",
     explicitInstallmentAcceptance:
       overrides.explicitInstallmentAcceptance ?? false,
+    requestedInstallmentCount: overrides.requestedInstallmentCount ?? null,
     mentionedPaymentAmount: overrides.mentionedPaymentAmount ?? null,
     summary: "Test",
     confidence: overrides.confidence ?? 0.95,

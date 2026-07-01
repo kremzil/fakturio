@@ -24,6 +24,21 @@ export type InvoiceEmailSummary = {
   variableSymbol?: string | null;
 };
 
+type TemplateOptions = {
+  afterParagraph?: number;
+  bodyHtml?: string;
+  skipHtmlPrefixes?: string[];
+};
+
+type InvoiceContextInput = {
+  invoiceData?: InvoiceEmailSummary | null;
+};
+
+type InstallmentContextInput = {
+  installmentSchedule?: InstallmentScheduleRow[] | null;
+  installmentCurrency?: string | null;
+};
+
 export function buildNeutralPaymentReply(input: {
   invoiceNumber: string;
   paymentDate: string;
@@ -115,23 +130,26 @@ export function buildInstallmentProposal(input: {
   invoiceNumber: string;
   currency: string;
   payments: InstallmentScheduleRow[];
+  description?: string;
 }): CollectionTemplate {
-  const rows = input.payments.map(
-    (payment) =>
-      `${payment.sequence}. splátka: ${formatEmailMoney(payment.amount, input.currency)}, splatná ${formatEmailDate(payment.dueDate)}`
-  );
+  const rows = installmentScheduleTextLines(input.payments, input.currency);
   return template(
     `Návrh splátkového kalendára k faktúre ${input.invoiceNumber}`,
     [
       "Dobrý deň,",
       "",
-      `k faktúre ${input.invoiceNumber} navrhujeme tento štandardný splátkový kalendár:`,
+      `k faktúre ${input.invoiceNumber} navrhujeme tento ${input.description ?? "štandardný splátkový kalendár"}:`,
       ...rows,
       "",
       "Prosíme, potvrďte výslovne, že súhlasíte so všetkými uvedenými sumami a dátumami.",
       "",
       "Ďakujeme."
-    ]
+    ],
+    {
+      afterParagraph: 2,
+      bodyHtml: renderInstallmentScheduleTable(input.payments, input.currency),
+      skipHtmlPrefixes: installmentScheduleSkipPrefixes()
+    }
   );
 }
 
@@ -140,21 +158,24 @@ export function buildInstallmentActivated(input: {
   payments: InstallmentScheduleRow[];
   currency: string;
 }): CollectionTemplate {
+  const rows = installmentScheduleTextLines(input.payments, input.currency);
   return template(
     `Potvrdenie splátkového kalendára k faktúre ${input.invoiceNumber}`,
     [
       "Dobrý deň,",
       "",
       "Vaše výslovné prijatie splátkového kalendára sme zaevidovali.",
-      ...input.payments.map(
-        (payment) =>
-          `${payment.sequence}. splátka: ${formatEmailMoney(payment.amount, input.currency)}, splatná ${formatEmailDate(payment.dueDate)}`
-      ),
+      ...rows,
       "",
       "Dodržanie jednotlivých termínov budeme priebežne overovať.",
       "",
       "Ďakujeme."
-    ]
+    ],
+    {
+      afterParagraph: 2,
+      bodyHtml: renderInstallmentScheduleTable(input.payments, input.currency),
+      skipHtmlPrefixes: installmentScheduleSkipPrefixes()
+    }
   );
 }
 
@@ -163,7 +184,7 @@ export function buildSecondReminder(input: {
   amountTotal: number;
   currency: string;
   creditorName: string;
-}): CollectionTemplate {
+} & InvoiceContextInput): CollectionTemplate {
   return template(
     `Druhá výzva na úhradu faktúry ${input.invoiceNumber}`,
     [
@@ -174,7 +195,35 @@ export function buildSecondReminder(input: {
       "Ak sa vec nevyrieši, veriteľ môže zvážiť ďalšie kroky na vymáhanie pohľadávky vrátane súdneho uplatnenia.",
       "",
       "Táto správa neznamená, že súdne konanie už bolo začaté."
-    ]
+    ],
+    invoiceContextOptions(input.invoiceData, { afterParagraph: 2 })
+  );
+}
+
+export function buildFinalNotice(input: {
+  invoiceNumber: string;
+  amountTotal: number;
+  currency: string;
+  creditorName: string;
+} & InvoiceContextInput): CollectionTemplate {
+  return template(
+    `Posledná výzva k faktúre ${input.invoiceNumber}`,
+    [
+      "Dobrý deň,",
+      "",
+      `${input.creditorName} naďalej eviduje faktúru ${input.invoiceNumber} vo výške ${formatEmailMoney(input.amountTotal, input.currency)} ako neuhradenú.`,
+      "",
+      "Ak odmietate úhradu tejto pohľadávky, prosíme, potvrďte výslovne, či je Vaše stanovisko konečné a z akého dôvodu úhradu odmietate.",
+      "",
+      "Ak nebude pohľadávka uhradená alebo vecne vysvetlená, veriteľ si vyhradzuje právo zvážiť ďalšie kroky na vymáhanie pohľadávky vrátane jej súdneho uplatnenia.",
+      "",
+      "Táto správa neznamená, že súdne konanie už bolo začaté. Ide o poslednú výzvu na vyriešenie veci mimosúdnou cestou.",
+      "",
+      "Prosíme, odpovedzte priamo na tento email.",
+      "",
+      "Ďakujeme."
+    ],
+    invoiceContextOptions(input.invoiceData, { afterParagraph: 2 })
   );
 }
 
@@ -184,6 +233,7 @@ export function buildInstallmentBrokenNotice(input: {
   missedAmount: number;
   currency: string;
   remainingAmount: number;
+  payments?: InstallmentScheduleRow[] | null;
 }): CollectionTemplate {
   return template(
     `Porušenie splátkového kalendára k faktúre ${input.invoiceNumber}`,
@@ -195,14 +245,20 @@ export function buildInstallmentBrokenNotice(input: {
       `Prosíme o bezodkladné kontaktovanie FAKTURIO alebo veriteľa a vyriešenie zostávajúcej sumy ${formatEmailMoney(input.remainingAmount, input.currency)}.`,
       "",
       "Ďakujeme."
-    ]
+    ],
+    input.payments?.length
+      ? {
+          afterParagraph: 3,
+          bodyHtml: renderInstallmentScheduleTable(input.payments, input.currency, "Dohodnutý splátkový kalendár")
+        }
+      : undefined
   );
 }
 
 export function buildCustomerAuthorizedDebtorMessage(input: {
   invoiceNumber: string;
   message: string;
-}): CollectionTemplate {
+} & InvoiceContextInput & InstallmentContextInput): CollectionTemplate {
   return template(
     `Správa veriteľa k faktúre ${input.invoiceNumber}`,
     [
@@ -215,7 +271,13 @@ export function buildCustomerAuthorizedDebtorMessage(input: {
       "Prosíme, odpovedzte priamo na tento email.",
       "",
       "Ďakujeme."
-    ]
+    ],
+    contextOptions({
+      invoiceData: input.invoiceData,
+      installmentSchedule: input.installmentSchedule,
+      installmentCurrency: input.installmentCurrency,
+      afterParagraph: 2
+    })
   );
 }
 
@@ -240,7 +302,8 @@ export function buildCustomerExceptionNotice(input: {
   title: string;
   summary: string;
   caseUrl: string;
-}): CollectionTemplate {
+  statusLine: string;
+} & InvoiceContextInput & InstallmentContextInput): CollectionTemplate {
   return template(
     `FAKTURIO: ${input.title} - ${input.invoiceNumber}`,
     [
@@ -249,8 +312,14 @@ export function buildCustomerExceptionNotice(input: {
       input.summary,
       `Prípad: ${input.caseUrl}`,
       "",
-      "Automatický postup bol pozastavený."
-    ]
+      input.statusLine
+    ],
+    contextOptions({
+      invoiceData: input.invoiceData,
+      installmentSchedule: input.installmentSchedule,
+      installmentCurrency: input.installmentCurrency,
+      afterParagraph: 2
+    })
   );
 }
 
@@ -260,7 +329,7 @@ export function buildCustomerDebtorReplyDecisionRequest(input: {
   debtorMessage: string | null;
   reason: string;
   caseUrl: string;
-}): CollectionTemplate {
+} & InvoiceContextInput & InstallmentContextInput): CollectionTemplate {
   return template(
     `FAKTURIO: potrebujeme rozhodnutie k ${input.invoiceNumber}`,
     [
@@ -284,7 +353,29 @@ export function buildCustomerDebtorReplyDecisionRequest(input: {
       `Prípad v dashboarde: ${input.caseUrl}`,
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    contextOptions({
+      invoiceData: input.invoiceData,
+      installmentSchedule: input.installmentSchedule,
+      installmentCurrency: input.installmentCurrency,
+      afterParagraph: 3
+    })
+  );
+}
+
+export function buildCustomerDebtorReplyDecisionAssistantRequest(input: {
+  subject: string;
+  textBody: string;
+} & InvoiceContextInput & InstallmentContextInput): CollectionTemplate {
+  return template(
+    input.subject,
+    input.textBody.split(/\r?\n/u),
+    contextOptions({
+      invoiceData: input.invoiceData,
+      installmentSchedule: input.installmentSchedule,
+      installmentCurrency: input.installmentCurrency,
+      afterParagraph: 2
+    })
   );
 }
 
@@ -412,7 +503,7 @@ export function buildCustomerAssistantAcknowledgement(input: {
   stillMissing: string[];
   confirmUrl?: string | null;
   dashboardUrl?: string | null;
-}): CollectionTemplate {
+} & InvoiceContextInput & InstallmentContextInput): CollectionTemplate {
   const reference = input.invoiceNumber || "prípadu";
   const missing =
     input.stillMissing.length > 0
@@ -433,7 +524,13 @@ export function buildCustomerAssistantAcknowledgement(input: {
       input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    contextOptions({
+      invoiceData: input.invoiceData,
+      installmentSchedule: input.installmentSchedule,
+      installmentCurrency: input.installmentCurrency,
+      afterParagraph: 3
+    })
   );
 }
 
@@ -441,7 +538,7 @@ export function buildCustomerMissingFieldsFollowUp(input: {
   invoiceNumber: string | null;
   stillMissing: string[];
   dashboardUrl?: string | null;
-}): CollectionTemplate {
+} & InvoiceContextInput): CollectionTemplate {
   const reference = input.invoiceNumber || "faktúre";
   return template(
     `FAKTURIO: potrebujeme ešte doplniť údaje k ${reference}`,
@@ -455,7 +552,14 @@ export function buildCustomerMissingFieldsFollowUp(input: {
       input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    {
+      afterParagraph: 2,
+      bodyHtml: [
+        input.invoiceData ? renderInvoiceSummaryTable(input.invoiceData, input.stillMissing) : "",
+        renderMissingFieldsBox(input.stillMissing)
+      ].join("")
+    }
   );
 }
 
@@ -480,7 +584,7 @@ export function buildCustomerActionNeedsConfirmation(input: {
   invoiceNumber: string | null;
   requestedAction: string;
   dashboardUrl?: string | null;
-}): CollectionTemplate {
+} & InvoiceContextInput): CollectionTemplate {
   const reference = input.invoiceNumber || "prípadu";
   return template(
     `FAKTURIO: akcia k ${reference} vyžaduje potvrdenie`,
@@ -495,7 +599,8 @@ export function buildCustomerActionNeedsConfirmation(input: {
       input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    invoiceContextOptions(input.invoiceData, { afterParagraph: 3 })
   );
 }
 
@@ -504,7 +609,7 @@ export function buildCustomerDebtorMessageBlocked(input: {
   requestedMessage: string;
   reason: string;
   dashboardUrl?: string | null;
-}): CollectionTemplate {
+} & InvoiceContextInput): CollectionTemplate {
   const reference = input.invoiceNumber || "prípadu";
   return template(
     `FAKTURIO: správu k ${reference} sme neodoslali`,
@@ -524,7 +629,8 @@ export function buildCustomerDebtorMessageBlocked(input: {
       input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    invoiceContextOptions(input.invoiceData, { afterParagraph: 3 })
   );
 }
 
@@ -532,7 +638,7 @@ export function buildCustomerManualReviewEscalation(input: {
   invoiceNumber: string | null;
   summary: string;
   dashboardUrl?: string | null;
-}): CollectionTemplate {
+} & InvoiceContextInput): CollectionTemplate {
   const reference = input.invoiceNumber || "prípadu";
   return template(
     `FAKTURIO: správa k ${reference} vyžaduje kontrolu`,
@@ -545,7 +651,8 @@ export function buildCustomerManualReviewEscalation(input: {
       input.dashboardUrl ? `Prípad v dashboarde: ${input.dashboardUrl}` : "",
       "",
       "Ďakujeme."
-    ].filter((line) => line !== "")
+    ].filter((line) => line !== ""),
+    invoiceContextOptions(input.invoiceData, { afterParagraph: 3 })
   );
 }
 
@@ -559,6 +666,8 @@ export function buildCustomerCaseStatusReply(input: {
   recentEvents?: string[];
   confirmUrl?: string | null;
   dashboardUrl?: string | null;
+  installmentSchedule?: InstallmentScheduleRow[] | null;
+  installmentCurrency?: string | null;
 }): CollectionTemplate {
   const reference = input.invoiceNumber || "prípadu";
   const amount =
@@ -595,7 +704,15 @@ export function buildCustomerCaseStatusReply(input: {
     ].filter((line) => line !== ""),
     {
       afterParagraph: 1,
-      bodyHtml: renderInvoiceSummaryTable(invoiceData),
+      bodyHtml: [
+        renderInvoiceSummaryTable(invoiceData),
+        input.installmentSchedule?.length
+          ? renderInstallmentScheduleTable(
+              input.installmentSchedule,
+              input.installmentCurrency ?? input.currency ?? "EUR"
+            )
+          : ""
+      ].join(""),
       skipHtmlPrefixes: [
         "Faktúra:",
         "Dlžník:",
@@ -609,7 +726,7 @@ export function buildCustomerCaseStatusReply(input: {
 function template(
   subject: string,
   lines: string[],
-  options?: { afterParagraph?: number; bodyHtml?: string; skipHtmlPrefixes?: string[] }
+  options?: TemplateOptions
 ): CollectionTemplate {
   const textBody = lines.join("\n");
   let paragraphIndex = 0;
@@ -632,6 +749,40 @@ function template(
   const preheader = lines.find((line) => line.trim().length > 0) ?? subject;
   const htmlBody = renderEmailDocument({ title: subject, preheader, bodyHtml });
   return { subject, textBody, htmlBody };
+}
+
+function invoiceContextOptions(
+  invoiceData: InvoiceEmailSummary | null | undefined,
+  options?: Pick<TemplateOptions, "afterParagraph">
+): TemplateOptions | undefined {
+  if (!invoiceData) {
+    return undefined;
+  }
+  return {
+    afterParagraph: options?.afterParagraph ?? 2,
+    bodyHtml: renderInvoiceSummaryTable(invoiceData)
+  };
+}
+
+function contextOptions(input: {
+  invoiceData?: InvoiceEmailSummary | null;
+  installmentSchedule?: InstallmentScheduleRow[] | null;
+  installmentCurrency?: string | null;
+  afterParagraph?: number;
+}): TemplateOptions | undefined {
+  const bodyHtml = [
+    input.invoiceData ? renderInvoiceSummaryTable(input.invoiceData) : "",
+    input.installmentSchedule?.length
+      ? renderInstallmentScheduleTable(input.installmentSchedule, input.installmentCurrency ?? "EUR")
+      : ""
+  ].join("");
+  if (!bodyHtml) {
+    return undefined;
+  }
+  return {
+    afterParagraph: input.afterParagraph ?? 2,
+    bodyHtml
+  };
 }
 
 function invoiceSummaryTextLines(input: InvoiceEmailSummary): string[] {
@@ -700,6 +851,50 @@ function renderInvoiceSummaryTable(
     '<div style="margin:18px 0">',
     '<p style="margin:0 0 8px;font-weight:700">Načítané údaje z faktúry</p>',
     '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px">',
+    rows,
+    "</table>",
+    "</div>"
+  ].join("");
+}
+
+function installmentScheduleTextLines(
+  payments: InstallmentScheduleRow[],
+  currency: string
+): string[] {
+  return payments.map(
+    (payment) =>
+      `${payment.sequence}. splátka: ${formatEmailMoney(payment.amount, currency)}, splatná ${formatEmailDate(payment.dueDate)}`
+  );
+}
+
+function installmentScheduleSkipPrefixes(): string[] {
+  return ["1. splátka:", "2. splátka:", "3. splátka:", "4. splátka:", "5. splátka:", "6. splátka:", "7. splátka:", "8. splátka:", "9. splátka:"];
+}
+
+function renderInstallmentScheduleTable(
+  payments: InstallmentScheduleRow[],
+  currency: string,
+  title = "Splátkový kalendár"
+): string {
+  if (payments.length === 0) {
+    return "";
+  }
+  const rows = payments
+    .map((payment) =>
+      [
+        "<tr>",
+        `<td style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661">${payment.sequence}. splátka</td>`,
+        `<td style="border:1px solid #d9ddd5;padding:8px 10px;color:#1d1d1b;font-weight:700">${escapeHtml(formatEmailMoney(payment.amount, currency))}</td>`,
+        `<td style="border:1px solid #d9ddd5;padding:8px 10px;color:#1d1d1b;font-weight:700">${escapeHtml(formatEmailDate(payment.dueDate))}</td>`,
+        "</tr>"
+      ].join("")
+    )
+    .join("");
+  return [
+    '<div style="margin:18px 0">',
+    `<p style="margin:0 0 8px;font-weight:700">${escapeHtml(title)}</p>`,
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px">',
+    '<tr><th align="left" style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;background:#f6f7f4">Splátka</th><th align="left" style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;background:#f6f7f4">Suma</th><th align="left" style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;background:#f6f7f4">Splatnosť</th></tr>',
     rows,
     "</table>",
     "</div>"

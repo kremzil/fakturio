@@ -106,15 +106,19 @@ function buildRawMimeMessage(input: SendEmailInput): string {
     "",
     `--${alternativeBoundary}`,
     'Content-Type: text/plain; charset="UTF-8"',
-    "Content-Transfer-Encoding: quoted-printable",
+    "Content-Transfer-Encoding: base64",
     "",
-    quotedPrintable(input.textBody),
+    chunkBase64(Buffer.from(input.textBody, "utf8").toString("base64")),
     "",
     `--${alternativeBoundary}`,
     'Content-Type: text/html; charset="UTF-8"',
-    "Content-Transfer-Encoding: quoted-printable",
+    "Content-Transfer-Encoding: base64",
     "",
-    quotedPrintable(input.htmlBody ?? htmlFromText(input.textBody)),
+    chunkBase64(
+      Buffer.from(input.htmlBody ?? htmlFromText(input.textBody), "utf8").toString(
+        "base64"
+      )
+    ),
     "",
     `--${alternativeBoundary}--`
   ];
@@ -148,14 +152,6 @@ function encodeMimeHeader(value: string): string {
 
 function escapeMimeParameter(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function quotedPrintable(value: string): string {
-  return Buffer.from(value, "utf8")
-    .toString("hex")
-    .replace(/([0-9a-f]{2})/gi, "=$1")
-    .replace(/(.{1,72})/g, "$1\r\n")
-    .trim();
 }
 
 function htmlFromText(value: string): string {

@@ -405,6 +405,7 @@ describe("email invoice intake idempotency", () => {
         invoiceNumber: "FV-ALIAS-STATUS",
         debtorName: null
       },
+      requestedInstallmentPlan: emptyRequestedInstallmentPlan(),
       customerNote: null,
       requestedAction: null,
       needsHumanReview: false,
@@ -594,6 +595,114 @@ describe("email invoice intake idempotency", () => {
     });
     expect(sent[0]?.textBody).toContain("štandardný splátkový kalendár");
     expect(sent[1]?.textBody).toContain("poslali dlžníkovi");
+  });
+
+  it("sends a custom installment proposal when the customer authorizes it by email", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-custom-installment-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Custom Installment Debtor s.r.o.",
+        email: "custom-installment-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        debtorId: debtor.id,
+        sourceType: "EMAIL",
+        status: "INSTALLMENT_PLAN_SENT",
+        invoiceNumber: "FV-CUSTOM-INSTALLMENT",
+        dueDate: new Date("2026-06-01T00:00:00.000Z"),
+        amountTotal: 1000,
+        currency: "EUR",
+        confirmedAt: new Date(),
+        automationPausedAt: new Date(),
+        automationPauseReason: "NON_STANDARD_INSTALLMENT_TERMS",
+        installmentPlans: {
+          create: {
+            totalAmount: 1000,
+            currency: "EUR",
+            payments: {
+              create: [
+                { sequence: 1, amount: 333.33, dueDate: new Date("2026-07-01T00:00:00.000Z") },
+                { sequence: 2, amount: 333.33, dueDate: new Date("2026-07-15T00:00:00.000Z") },
+                { sequence: 3, amount: 333.34, dueDate: new Date("2026-07-29T00:00:00.000Z") }
+              ]
+            }
+          }
+        }
+      }
+    });
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async () =>
+        customerClassification({
+          intent: "REQUEST_CUSTOM_INSTALLMENT_PLAN",
+          summary: "Customer authorized five equal installments.",
+          requestedAction: "Navrhni dlžníkovi 5 rovnakých splátok.",
+          requestedInstallmentPlan: {
+            paymentCount: 5,
+            firstPaymentAmount: null,
+            paymentAmounts: [],
+            dueDates: [],
+            note: "5 rovnakých splátok"
+          }
+        })
+      ),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        providerId: `${RUN_ID}-custom-installment-authorized`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Re: splátky",
+        textBody: "Áno, navrhnite mu 5 rovnakých splátok.",
+        attachments: []
+      })
+    );
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      status: "INSTALLMENT_PLAN_SENT",
+      intent: "REQUEST_CUSTOM_INSTALLMENT_PLAN",
+      replySent: true
+    });
+    const plans = await prisma.installmentPlan.findMany({
+      where: { caseId: collectionCase.id },
+      include: { payments: { orderBy: { sequence: "asc" } } },
+      orderBy: { createdAt: "asc" }
+    });
+    expect(plans).toHaveLength(2);
+    expect(plans[0]?.status).toBe("REJECTED");
+    expect(plans[1]?.status).toBe("PROPOSED");
+    expect(plans[1]?.payments.map((payment) => Number(payment.amount))).toEqual([
+      200,
+      200,
+      200,
+      200,
+      200
+    ]);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toMatchObject({
+      to: ["custom-installment-debtor@example.com"],
+      replyTo: [expect.stringMatching(/^reply\+/)]
+    });
+    expect(sent[0]?.textBody).toContain("veriteľom schválený splátkový kalendár");
+    expect(sent[0]?.textBody).toContain("5. splátka");
+    expect(sent[1]?.textBody).toContain("Vlastný splátkový kalendár");
   });
 
   it("does not restore an automation-paused case to parsed for a status question", async () => {
@@ -827,6 +936,88 @@ describe("email invoice intake idempotency", () => {
     expect(sent[0]?.textBody).toContain("právnu hrozbu");
   });
 
+  it("sends an approved final notice from a direct dashboard command", async () => {
+    const sent: SendEmailInput[] = [];
+    const emailProvider: EmailProvider = {
+      async sendEmail(input) {
+        sent.push(input);
+        return {
+          provider: "fixture",
+          providerId: `${RUN_ID}-final-notice-${sent.length}@example.com`
+        };
+      },
+      async parseInbound() {
+        throw new Error("not used");
+      }
+    };
+    const debtor = await prisma.debtor.create({
+      data: {
+        organizationId,
+        name: "Final Notice Debtor s.r.o.",
+        email: "final-notice-debtor@example.com"
+      }
+    });
+    const collectionCase = await prisma.case.create({
+      data: {
+        organizationId,
+        debtorId: debtor.id,
+        sourceType: "EMAIL",
+        status: "EMAIL_REMINDER_1_SENT",
+        invoiceNumber: "FV-FINAL-NOTICE",
+        dueDate: new Date("2026-06-01T00:00:00.000Z"),
+        amountTotal: 1200,
+        currency: "EUR",
+        confirmedAt: new Date()
+      }
+    });
+
+    const result = await new CustomerEmailAssistantService({
+      ai: customerMessageOnlyAi(async () =>
+        customerClassification({
+          intent: "REQUEST_FINAL_NOTICE",
+          summary:
+            "Customer asks to send the approved final notice after the debtor refused to pay.",
+          requestedAction: "Send approved final notice",
+          customerNote:
+            "Pošlite schválenú poslednú výzvu a opýtajte sa, či je odmietnutie konečné.",
+          needsHumanReview: false
+        })
+      ),
+      email: emailProvider
+    }).process(
+      inboundEmail({
+        provider: "dashboard",
+        providerId: `${RUN_ID}-direct-final-notice`,
+        from: "client@example.com",
+        to: [signedClarifyAddressForTest(collectionCase.id)],
+        subject: "Dashboard assistant",
+        textBody:
+          "Pošlite schválenú poslednú výzvu a opýtajte sa, či je odmietnutie konečné.",
+        attachments: []
+      }),
+      undefined,
+      { sendReply: false, directUserCommand: true }
+    );
+
+    expect(result).toMatchObject({
+      caseId: collectionCase.id,
+      intent: "REQUEST_FINAL_NOTICE",
+      replySent: false,
+      action: { kind: "FINAL_NOTICE_SENT" }
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.to).toEqual(["final-notice-debtor@example.com"]);
+    expect(sent[0]?.textBody).toContain("vyhradzuje právo");
+    expect(sent[0]?.textBody).toContain("súdneho uplatnenia");
+    expect(sent[0]?.textBody).toContain("či je Vaše stanovisko konečné");
+
+    const updated = await prisma.case.findUniqueOrThrow({
+      where: { id: collectionCase.id },
+      select: { status: true }
+    });
+    expect(updated.status).toBe("FINAL_NOTICE_SENT");
+  });
+
   it("stores ambiguous alias emails in a manual-review container case", async () => {
     const sent: SendEmailInput[] = [];
     const emailProvider: EmailProvider = {
@@ -852,6 +1043,7 @@ describe("email invoice intake idempotency", () => {
         invoiceNumber: null,
         debtorName: null
       },
+      requestedInstallmentPlan: emptyRequestedInstallmentPlan(),
       customerNote: "Please check this.",
       requestedAction: null,
       needsHumanReview: false,
@@ -1300,6 +1492,12 @@ function multiAttachmentAi(
     async classifyCustomerMessage() {
       throw new Error("not used");
     },
+    async answerDashboardCaseMessage() {
+      throw new Error("not used");
+    },
+    async draftCustomerDecisionEmail() {
+      throw new Error("not used");
+    },
     async generateDebtorEmail() {
       throw new Error("not used");
     },
@@ -1345,6 +1543,16 @@ function emptyFields() {
   };
 }
 
+function emptyRequestedInstallmentPlan() {
+  return {
+    paymentCount: null,
+    firstPaymentAmount: null,
+    paymentAmounts: [],
+    dueDates: [],
+    note: null
+  };
+}
+
 function customerClassification(
   overrides: Partial<Awaited<ReturnType<AiProvider["classifyCustomerMessage"]>>>
 ): Awaited<ReturnType<AiProvider["classifyCustomerMessage"]>> {
@@ -1358,6 +1566,9 @@ function customerClassification(
       caseId: null,
       invoiceNumber: null,
       debtorName: null
+    },
+    requestedInstallmentPlan: {
+      ...emptyRequestedInstallmentPlan()
     },
     customerNote: null,
     requestedAction: null,
@@ -1381,6 +1592,12 @@ function customerMessageOnlyAi(
       throw new Error("not used");
     },
     classifyCustomerMessage,
+    async answerDashboardCaseMessage() {
+      throw new Error("not used");
+    },
+    async draftCustomerDecisionEmail() {
+      throw new Error("not used");
+    },
     async generateDebtorEmail() {
       throw new Error("not used");
     },
@@ -1459,11 +1676,18 @@ function missingInvoiceAi(): AiProvider {
           invoiceNumber: null,
           debtorName: null
         },
+        requestedInstallmentPlan: emptyRequestedInstallmentPlan(),
         customerNote: null,
         requestedAction: "send details by email for review",
         needsHumanReview: false,
         replyDraft: null
       };
+    },
+    async answerDashboardCaseMessage() {
+      throw new Error("not used");
+    },
+    async draftCustomerDecisionEmail() {
+      throw new Error("not used");
     },
     async generateDebtorEmail() {
       throw new Error("not used");
@@ -1510,11 +1734,18 @@ function actionRequestAi(): AiProvider {
           invoiceNumber: null,
           debtorName: null
         },
+        requestedInstallmentPlan: emptyRequestedInstallmentPlan(),
         customerNote: "Customer asked to mark paid.",
         requestedAction: "MARK_PAID",
         needsHumanReview: false,
         replyDraft: null
       };
+    },
+    async answerDashboardCaseMessage() {
+      throw new Error("not used");
+    },
+    async draftCustomerDecisionEmail() {
+      throw new Error("not used");
     },
     async generateDebtorEmail() {
       throw new Error("not used");

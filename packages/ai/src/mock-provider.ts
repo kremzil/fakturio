@@ -2,8 +2,12 @@ import {
   AiProvider,
   CaseSummary,
   CaseSummaryInput,
+  CustomerDecisionEmailDraft,
+  CustomerDecisionEmailInput,
   CustomerMessageClassification,
   CustomerMessageInput,
+  DashboardCaseAssistantInput,
+  DashboardCaseAssistantReply,
   DebtorReplyClassification,
   DebtorReplyInput,
   GenerateEmailInput,
@@ -129,6 +133,7 @@ export class MockAiProvider implements AiProvider {
       promisedPaymentDate: null,
       installmentRequested: intent === "INSTALLMENT_REQUEST",
       explicitInstallmentAcceptance: intent === "INSTALLMENT_ACCEPTED",
+      requestedInstallmentCount: extractPaymentCount(input.messageText),
       mentionedPaymentAmount: null,
       summary: input.messageText.slice(0, 240),
       confidence: 0.72,
@@ -206,6 +211,16 @@ export class MockAiProvider implements AiProvider {
       lower.includes("posli mu") ||
       lower.includes("send debtor") ||
       lower.includes("напиши должнику");
+    const asksFinalNotice =
+      lower.includes("posledn") ||
+      lower.includes("final notice") ||
+      lower.includes("predžalob") ||
+      lower.includes("predzalob") ||
+      lower.includes("súd") ||
+      lower.includes("sud") ||
+      lower.includes("court") ||
+      lower.includes("суд") ||
+      lower.includes("принудительн");
     const mutating = lower.includes("označ") || lower.includes("oznac") || lower.includes("cancel") || lower.includes("zastav") || lower.includes("pauz");
     const asksStatus = lower.includes("stav") || lower.includes("status");
 
@@ -213,7 +228,9 @@ export class MockAiProvider implements AiProvider {
       ? "REQUEST_STANDARD_INSTALLMENT_PLAN"
       : asksCustomInstallment
         ? "REQUEST_CUSTOM_INSTALLMENT_PLAN"
-        : asksDebtorMessage
+        : asksFinalNotice
+          ? "REQUEST_FINAL_NOTICE"
+          : asksDebtorMessage
           ? "REQUEST_SEND_DEBTOR_MESSAGE"
           : asksHistory
             ? "ASK_CASE_HISTORY"
@@ -243,13 +260,113 @@ export class MockAiProvider implements AiProvider {
         invoiceNumber: fields.invoiceNumber,
         debtorName: fields.debtorName
       },
+      requestedInstallmentPlan: {
+        paymentCount: asksCustomInstallment
+          ? extractPaymentCount(input.messageText)
+          : null,
+        firstPaymentAmount: asksCustomInstallment
+          ? extractFirstPaymentAmount(input.messageText)
+          : null,
+        paymentAmounts: [],
+        dueDates: [],
+        note: asksCustomInstallment ? input.messageText.slice(0, 240) : null
+      },
       customerNote: hasFields ? null : input.messageText.slice(0, 500),
       requestedAction:
-        mutating || asksStart || asksStandardInstallment || asksCustomInstallment || asksDebtorMessage
+        mutating || asksStart || asksStandardInstallment || asksCustomInstallment || asksDebtorMessage || asksFinalNotice
           ? input.messageText.slice(0, 240)
           : null,
       needsHumanReview: false,
       replyDraft: asksCustomInstallment || asksDebtorMessage ? input.messageText.slice(0, 500) : null
+    };
+  }
+
+  async answerDashboardCaseMessage(
+    input: DashboardCaseAssistantInput
+  ): Promise<DashboardCaseAssistantReply> {
+    const latestDebtor = input.recentCommunications.find(
+      (message) =>
+        message.direction === "INBOUND" &&
+        message.kind !== "customer-email-assistant-message" &&
+        message.textBody
+    );
+    const amount =
+      input.caseSnapshot.amountTotal !== null
+        ? `${input.caseSnapshot.amountTotal.toFixed(2)} ${input.caseSnapshot.currency ?? "EUR"}`
+        : "nezadaná";
+    const paused = input.caseSnapshot.automationPaused
+      ? input.userLanguage === "ru"
+        ? `Автоматизация на паузе: ${input.caseSnapshot.automationPauseReason ?? "причина не указана"}.`
+        : `Automatizácia je pozastavená: ${input.caseSnapshot.automationPauseReason ?? "dôvod nie je uvedený"}.`
+      : input.userLanguage === "ru"
+        ? "Автоматизация сейчас не на паузе."
+        : "Automatizácia teraz nie je pozastavená.";
+
+    if (input.userLanguage === "ru") {
+      return {
+        subject: `Ситуация по делу ${input.caseSnapshot.invoiceNumber ?? input.caseId}`,
+        textBody: [
+          `По делу ${input.caseSnapshot.invoiceNumber ?? input.caseId}: должник ${input.caseSnapshot.debtorName ?? "не указан"}, сумма ${amount}, срок оплаты ${input.caseSnapshot.dueDate ?? "не указан"}.`,
+          paused,
+          latestDebtor?.textBody
+            ? `Последний ответ должника: “${latestDebtor.textBody.slice(0, 280)}”`
+            : "Последнего читаемого ответа должника в контексте нет.",
+          input.allowedActions.length > 0
+            ? `Дальше можно: ${input.allowedActions.join(", ")}.`
+            : "Сейчас нет доступных автоматических действий."
+        ].join("\n\n"),
+        suggestedActions: input.allowedActions,
+        needsHumanDecision: input.caseSnapshot.automationPaused
+      };
+    }
+
+    return {
+      subject: `Situácia k prípadu ${input.caseSnapshot.invoiceNumber ?? input.caseId}`,
+      textBody: [
+        `K prípadu ${input.caseSnapshot.invoiceNumber ?? input.caseId}: dlžník ${input.caseSnapshot.debtorName ?? "nezadaný"}, suma ${amount}, splatnosť ${input.caseSnapshot.dueDate ?? "nezadaná"}.`,
+        paused,
+        latestDebtor?.textBody
+          ? `Posledná odpoveď dlžníka: „${latestDebtor.textBody.slice(0, 280)}“`
+          : "V kontexte nie je posledná čitateľná odpoveď dlžníka.",
+        input.allowedActions.length > 0
+          ? `Ďalej môžete: ${input.allowedActions.join(", ")}.`
+          : "Momentálne nie je dostupná automatická akcia."
+      ].join("\n\n"),
+      suggestedActions: input.allowedActions,
+      needsHumanDecision: input.caseSnapshot.automationPaused
+    };
+  }
+
+  async draftCustomerDecisionEmail(
+    input: CustomerDecisionEmailInput
+  ): Promise<CustomerDecisionEmailDraft> {
+    const invoice = input.invoiceNumber || input.caseId;
+    const debtor = input.debtorName ?? "dlžník";
+    const amount =
+      input.amountTotal !== null
+        ? `${input.amountTotal.toFixed(2)} ${input.currency ?? "EUR"}`
+        : "nezadaná suma";
+    return {
+      subject: `FAKTURIO: potrebujeme rozhodnutie k ${invoice}`,
+      textBody: [
+        "Dobrý deň,",
+        "",
+        `pri faktúre ${invoice} je automatizácia pozastavená, pretože potrebujeme Vaše rozhodnutie.`,
+        `Dlžník ${debtor} odpovedal k prípadu. Evidovaná suma je ${amount}.`,
+        input.debtorMessage
+          ? `Z odpovede dlžníka: „${input.debtorMessage.slice(0, 500)}“`
+          : "Odpoveď dlžníka nemá čitateľný text.",
+        "",
+        `Dôvod pozastavenia: ${input.decisionReason}`,
+        "",
+        "Môžete odpovedať priamo na tento email napríklad:",
+        ...input.allowedReplies.map((reply) => `- ${reply}`),
+        "",
+        `Prípad v dashboarde: ${input.caseUrl}`,
+        "",
+        "Ďakujeme."
+      ].join("\n"),
+      summaryForAudit: `Mock customer decision email drafted for ${invoice}.`
     };
   }
 
@@ -293,4 +410,39 @@ function normalizeMockAmount(value: string): number | null {
   }
   const parsed = Number.parseFloat(match[0].replace(",", "."));
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function extractPaymentCount(value: string): number | null {
+  const lower = value.toLowerCase();
+  const digit = lower.match(
+    /(?:na|do|v|into|for|раздели(?:ть)?\s+на)\s+(\d{1,2})\s*(?:spl[aá]tk|payment|платеж|платёж)/u
+  );
+  if (digit) {
+    return Number(digit[1]);
+  }
+  const words: Record<string, number> = {
+    dve: 2,
+    dva: 2,
+    tri: 3,
+    styri: 4,
+    štyri: 4,
+    pat: 5,
+    päť: 5,
+    five: 5,
+    пять: 5
+  };
+  for (const [word, count] of Object.entries(words)) {
+    if (lower.includes(`${word} spl`) || lower.includes(`${word} плат`)) {
+      return count;
+    }
+  }
+  return null;
+}
+
+function extractFirstPaymentAmount(value: string): number | null {
+  const lower = value.toLowerCase();
+  const match = lower.match(
+    /(?:prv[aá]|first|первы[йя]|1\.?)\s+(?:spl[aá]tka|payment|оплат[ауы]|плат[её]ж)[^\d]*(\d+(?:[,.]\d{1,2})?)/u
+  );
+  return match ? Number(match[1].replace(",", ".")) : null;
 }

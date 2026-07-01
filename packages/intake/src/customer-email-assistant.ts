@@ -10,16 +10,22 @@ import {
   buildCustomerManualReviewEscalation,
   buildCustomerMissingFieldsFollowUp,
   buildCustomerAuthorizedDebtorMessage,
+  buildFinalNotice,
   buildInstallmentProposal,
   createEmailProvider,
   type EmailProvider,
-  type InboundEmail
+  type InboundEmail,
+  type InstallmentScheduleRow,
+  type InvoiceEmailSummary
 } from "@fakturio/email";
 import {
   CASE_EVENT_TYPES,
   CASE_CONFIRM_TOKEN_DEFAULT_TTL_MS,
   CUSTOMER_COMMUNICATION_KINDS,
+  TERMINAL_CASE_STATUSES,
+  WORKFLOW_COMMAND_TYPES,
   assertCaseTransition,
+  calculateCustomInstallmentSchedule,
   calculateInstallmentSchedule,
   type CaseStatus,
   type CustomerMessageClassification,
@@ -47,6 +53,14 @@ const MUTATING_INTENTS = new Set([
   "REQUEST_MARK_PAID",
   "REQUEST_CANCEL"
 ]);
+const DIRECT_USER_ACTION_INTENTS = new Set([
+  ...MUTATING_INTENTS,
+  "REQUEST_CONFIRM_INVOICE",
+  "REQUEST_STANDARD_INSTALLMENT_PLAN",
+  "REQUEST_CUSTOM_INSTALLMENT_PLAN",
+  "REQUEST_SEND_DEBTOR_MESSAGE",
+  "REQUEST_FINAL_NOTICE"
+]);
 
 export type CustomerEmailAssistantResult = {
   caseId: string | null;
@@ -58,6 +72,7 @@ export type CustomerEmailAssistantResult = {
   status: string | null;
   intent: string;
   replySent: boolean;
+  action: CustomerAssistantActionResult;
   assistantReply: {
     subject: string;
     textBody: string;
@@ -66,6 +81,8 @@ export type CustomerEmailAssistantResult = {
 
 export type CustomerEmailAssistantProcessOptions = {
   sendReply?: boolean;
+  directUserCommand?: boolean;
+  actorUserId?: string;
 };
 
 type CustomerEmailAssistantDependencies = {
@@ -74,13 +91,23 @@ type CustomerEmailAssistantDependencies = {
   storage: StorageProvider;
 };
 
-type CustomerAssistantActionResult =
+export type CustomerAssistantActionResult =
   | { kind: "NONE" }
   | { kind: "CASE_CONFIRMED" }
   | { kind: "CASE_ALREADY_CONFIRMED" }
+  | { kind: "CASE_PAUSED" }
+  | { kind: "CASE_ALREADY_PAUSED" }
+  | { kind: "CASE_RESUMED" }
+  | { kind: "CASE_ALREADY_ACTIVE" }
+  | { kind: "CASE_MARKED_PAID" }
+  | { kind: "CASE_CANCELLED" }
+  | { kind: "CASE_ALREADY_CANCELLED" }
   | { kind: "INSTALLMENT_PROPOSAL_SENT" }
+  | { kind: "CUSTOM_INSTALLMENT_PROPOSAL_SENT" }
   | { kind: "INSTALLMENT_PROPOSAL_ALREADY_EXISTS" }
   | { kind: "DEBTOR_MESSAGE_SENT" }
+  | { kind: "FINAL_NOTICE_SENT" }
+  | { kind: "FINAL_NOTICE_ALREADY_SENT" }
   | { kind: "ACTION_BLOCKED"; reason: string };
 
 type CustomerCandidateCase = NonNullable<CustomerMessageInput["candidateCases"]>[number];
@@ -145,6 +172,7 @@ export class CustomerEmailAssistantService {
         status: "MANUAL_REVIEW_REQUIRED",
         intent: "OTHER",
         replySent: unmatched.replySent,
+        action: { kind: "NONE" },
         assistantReply: unmatched.reply
       };
     }
@@ -165,6 +193,7 @@ export class CustomerEmailAssistantService {
         status: existing.case.status,
         intent: stringValue(jsonRecord(existing.aiClassification).intent) ?? "OTHER",
         replySent: false,
+        action: { kind: "NONE" },
         assistantReply: null
       };
     }
@@ -176,7 +205,13 @@ export class CustomerEmailAssistantService {
       },
       include: {
         debtor: true,
-        events: { orderBy: { createdAt: "desc" }, take: 8 }
+        events: { orderBy: { createdAt: "desc" }, take: 8 },
+        installmentPlans: {
+          where: { status: { in: ["PROPOSED", "ACTIVE"] } },
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: { payments: { orderBy: { sequence: "asc" } } }
+        }
       }
     });
     if (!collectionCase) {
@@ -225,6 +260,7 @@ export class CustomerEmailAssistantService {
         status: multiAttachmentClarification.status,
         intent: "PROVIDE_INVOICE_FIELDS",
         replySent: shouldSendReply,
+        action: { kind: "NONE" },
         assistantReply: multiAttachmentClarification.stillNeedsClarification
           ? null
           : templateReply(buildCustomerAssistantAcknowledgement({
@@ -281,7 +317,9 @@ export class CustomerEmailAssistantService {
         }
       });
 
-      const decision = applySafeCustomerDecision(collectionCase, safeClassification);
+      const decision = applySafeCustomerDecision(collectionCase, safeClassification, {
+        directUserCommand: options.directUserCommand === true
+      });
       const caseUpdate: Prisma.CaseUpdateInput = { ...(decision.caseUpdate ?? {}) };
       if (decision.debtorPatch) {
         if (collectionCase.debtorId) {
@@ -350,13 +388,21 @@ export class CustomerEmailAssistantService {
         deps: this.deps,
         collectionCase: refreshed,
         classification: safeClassification,
-        communicationId: result.communicationId
+        communicationId: result.communicationId,
+        directUserCommand: options.directUserCommand === true,
+        actorUserId: options.actorUserId
       });
       const afterAction = await prisma.case.findFirstOrThrow({
         where: { id: refreshed.id, organizationId: result.organizationId },
         include: {
           debtor: true,
-          events: { orderBy: { createdAt: "desc" }, take: 8 }
+          events: { orderBy: { createdAt: "desc" }, take: 8 },
+          installmentPlans: {
+            where: { status: { in: ["PROPOSED", "ACTIVE"] } },
+            orderBy: { createdAt: "desc" },
+            take: 1,
+            include: { payments: { orderBy: { sequence: "asc" } } }
+          }
         }
       });
       const template = chooseCustomerAssistantReply(
@@ -379,6 +425,7 @@ export class CustomerEmailAssistantService {
         ...result,
         status: afterAction.status,
         replySent: shouldSendReply,
+        action: actionResult,
         assistantReply: templateReply(template)
       };
     });
@@ -552,7 +599,8 @@ function applySafeCustomerDecision(
     warnings: string[];
     automationPausedAt: Date | null;
   },
-  classification: CustomerMessageClassification
+  classification: CustomerMessageClassification,
+  options: { directUserCommand?: boolean } = {}
 ): {
   caseUpdate?: Prisma.CaseUpdateInput;
   event?: Prisma.CaseEventCreateWithoutCaseInput;
@@ -560,7 +608,7 @@ function applySafeCustomerDecision(
   appliedFields: string[];
   stillMissing: string[];
 } {
-  const safe = isSafeToApply(classification);
+  const safe = isSafeToApply(classification, options);
   const patch = safe ? buildCasePatch(collectionCase, classification) : {};
   const validation = validateInvoiceForWorkflow({
     invoiceNumber: patch.invoiceNumber ?? collectionCase.invoiceNumber,
@@ -661,16 +709,75 @@ function applySafeCustomerDecision(
   };
 }
 
-function isSafeToApply(classification: CustomerMessageClassification): boolean {
+function isSafeToApply(
+  classification: CustomerMessageClassification,
+  options: { directUserCommand?: boolean } = {}
+): boolean {
+  if (classification.confidence < CUSTOMER_MESSAGE_CONFIDENCE_THRESHOLD) {
+    return false;
+  }
+  if (classification.intent === "UNSAFE_OR_LEGAL") {
+    return false;
+  }
+  if (options.directUserCommand) {
+    if (hasForbiddenDirectActionRisk(classification)) {
+      return false;
+    }
+    if (DIRECT_USER_ACTION_INTENTS.has(classification.intent)) {
+      return true;
+    }
+  }
   if (
-    classification.confidence < CUSTOMER_MESSAGE_CONFIDENCE_THRESHOLD ||
     classification.needsHumanReview ||
-    classification.intent === "UNSAFE_OR_LEGAL" ||
     MUTATING_INTENTS.has(classification.intent)
   ) {
     return false;
   }
   return true;
+}
+
+function hasForbiddenDirectActionRisk(
+  classification: CustomerMessageClassification
+): boolean {
+  if (classification.intent === "REQUEST_FINAL_NOTICE") {
+    return false;
+  }
+  const text = [
+    classification.summary,
+    classification.requestedAction,
+    classification.customerNote,
+    classification.replyDraft
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLocaleLowerCase("sk");
+  if (!text) {
+    return false;
+  }
+  return [
+    "súd",
+    "sud",
+    "súdne",
+    "sudne",
+    "žalob",
+    "zalob",
+    "exekú",
+    "exeku",
+    "court",
+    "lawsuit",
+    "legal action",
+    "суд",
+    "иск",
+    "юрид",
+    "discount",
+    "zľav",
+    "zlav",
+    "скид",
+    "odpusti",
+    "odpís",
+    "odpis",
+    "write off"
+  ].some((phrase) => text.includes(phrase));
 }
 
 function buildCasePatch(
@@ -743,26 +850,44 @@ async function applyCustomerAssistantAction(input: {
     status: string;
     workflowId: string | null;
     confirmedAt: Date | null;
+    updatedAt: Date;
     invoiceNumber: string | null;
     dueDate: Date | null;
+    nextActionAt: Date | null;
     amountTotal: Prisma.Decimal | null;
     currency: string | null;
     warnings: string[];
+    automationPausedAt: Date | null;
     debtor: { id: string; name: string; email: string | null } | null;
   };
   classification: CustomerMessageClassification;
   communicationId: string | null;
+  directUserCommand?: boolean;
+  actorUserId?: string;
 }): Promise<CustomerAssistantActionResult> {
+  if (input.directUserCommand && MUTATING_INTENTS.has(input.classification.intent)) {
+    return applyDirectUserCaseAction(input);
+  }
+
   if (
     input.classification.intent !== "REQUEST_CONFIRM_INVOICE" &&
     input.classification.intent !== "REQUEST_STANDARD_INSTALLMENT_PLAN" &&
     input.classification.intent !== "REQUEST_CUSTOM_INSTALLMENT_PLAN" &&
-    input.classification.intent !== "REQUEST_SEND_DEBTOR_MESSAGE"
+    input.classification.intent !== "REQUEST_SEND_DEBTOR_MESSAGE" &&
+    input.classification.intent !== "REQUEST_FINAL_NOTICE"
   ) {
     return { kind: "NONE" };
   }
 
-  if (!isSafeToApply(input.classification)) {
+  if (input.classification.intent === "REQUEST_FINAL_NOTICE" && !input.directUserCommand) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason:
+        "Schválenú poslednú výzvu je potrebné potvrdiť v dashboarde alebo v asistentskom chate."
+    };
+  }
+
+  if (!isSafeToApply(input.classification, { directUserCommand: input.directUserCommand })) {
     return {
       kind: "ACTION_BLOCKED",
       reason: "Požiadavka vyžaduje manuálne potvrdenie v dashboarde."
@@ -777,7 +902,230 @@ async function applyCustomerAssistantAction(input: {
     return sendStandardInstallmentProposalFromCustomer(input);
   }
 
+  if (input.classification.intent === "REQUEST_CUSTOM_INSTALLMENT_PLAN") {
+    return sendCustomInstallmentProposalFromCustomer(input);
+  }
+
+  if (input.classification.intent === "REQUEST_FINAL_NOTICE") {
+    return sendFinalNoticeFromCustomer(input);
+  }
+
   return sendCustomerAuthorizedDebtorMessage(input);
+}
+
+async function applyDirectUserCaseAction(input: {
+  collectionCase: {
+    id: string;
+    organizationId: string;
+    status: string;
+    confirmedAt: Date | null;
+    workflowId: string | null;
+    updatedAt: Date;
+    dueDate: Date | null;
+    nextActionAt: Date | null;
+    automationPausedAt: Date | null;
+  };
+  classification: CustomerMessageClassification;
+  communicationId: string | null;
+  actorUserId?: string;
+}): Promise<CustomerAssistantActionResult> {
+  if (!isSafeToApply(input.classification, { directUserCommand: true })) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason:
+        "Pokyn obsahuje právne, zľavové alebo iné rizikové podmienky, ktoré nemôžem vykonať automaticky."
+    };
+  }
+
+  const action = input.classification.intent;
+  const collectionCase = input.collectionCase;
+  const status = collectionCase.status as CaseStatus;
+  const terminal = TERMINAL_CASE_STATUSES.includes(status);
+  const now = new Date();
+  let update: {
+    status?: CaseStatus;
+    closedAt?: Date | null;
+    nextActionAt?: Date | null;
+    automationPausedAt?: Date | null;
+    automationPauseReason?: string | null;
+  };
+  let eventType: string = CASE_EVENT_TYPES.statusChanged;
+  let note: string;
+  let commandAction: string;
+  let commandKey: string;
+  let shouldEnqueueCommand = true;
+  let resultKind: CustomerAssistantActionResult["kind"];
+
+  if (
+    (action === "REQUEST_PAUSE" ||
+      action === "REQUEST_RESUME" ||
+      action === "REQUEST_MARK_PAID") &&
+    !collectionCase.confirmedAt
+  ) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Najprv treba potvrdiť faktúru a spustiť prípad."
+    };
+  }
+
+  if (action === "REQUEST_MARK_PAID") {
+    if (terminal) {
+      return {
+        kind: "ACTION_BLOCKED",
+        reason: "Uzavretý prípad už nemožno označiť ako uhradený."
+      };
+    }
+    assertCaseTransition(status, "CLOSED_PAID");
+    update = {
+      status: "CLOSED_PAID",
+      closedAt: now,
+      nextActionAt: null,
+      automationPausedAt: null,
+      automationPauseReason: null
+    };
+    eventType = CASE_EVENT_TYPES.paymentMarkedPaid;
+    note = "Prípad bol označený ako uhradený na pokyn používateľa v asistentskom chate.";
+    commandAction = "MARK_PAID";
+    commandKey = `assistant-paid:${collectionCase.id}:${collectionCase.updatedAt.toISOString()}`;
+    resultKind = "CASE_MARKED_PAID";
+  } else if (action === "REQUEST_PAUSE") {
+    if (terminal) {
+      return {
+        kind: "ACTION_BLOCKED",
+        reason: "Uzavretý prípad už nemožno pozastaviť."
+      };
+    }
+    if (collectionCase.automationPausedAt) {
+      return { kind: "CASE_ALREADY_PAUSED" };
+    }
+    update = {
+      automationPausedAt: now,
+      automationPauseReason: "ASSISTANT_CHAT_PAUSE"
+    };
+    eventType = CASE_EVENT_TYPES.automationPaused;
+    note = "Automatizácia bola pozastavená na pokyn používateľa v asistentskom chate.";
+    commandAction = "PAUSE_AUTOMATION";
+    commandKey = `assistant-pause:${collectionCase.id}:${collectionCase.updatedAt.toISOString()}`;
+    resultKind = "CASE_PAUSED";
+  } else if (action === "REQUEST_RESUME") {
+    if (terminal) {
+      return {
+        kind: "ACTION_BLOCKED",
+        reason: "Uzavretý prípad už nemožno obnoviť."
+      };
+    }
+    if (!collectionCase.automationPausedAt) {
+      return { kind: "CASE_ALREADY_ACTIVE" };
+    }
+    update = {
+      nextActionAt: resolveDirectResumeActionAt(collectionCase),
+      automationPausedAt: null,
+      automationPauseReason: null
+    };
+    note = "Automatizácia bola obnovená na pokyn používateľa v asistentskom chate.";
+    commandAction = "RESUME_AUTOMATION";
+    commandKey = `assistant-resume:${collectionCase.id}:${collectionCase.automationPausedAt.toISOString()}`;
+    resultKind = "CASE_RESUMED";
+  } else if (action === "REQUEST_CANCEL") {
+    if (status === "CLOSED_CANCELLED") {
+      return { kind: "CASE_ALREADY_CANCELLED" };
+    }
+    if (terminal) {
+      return {
+        kind: "ACTION_BLOCKED",
+        reason: "Uzavretý prípad už nemožno zastaviť."
+      };
+    }
+    assertCaseTransition(status, "CLOSED_CANCELLED");
+    update = {
+      status: "CLOSED_CANCELLED",
+      closedAt: now,
+      nextActionAt: null,
+      automationPausedAt: null,
+      automationPauseReason: null
+    };
+    note = "Prípad bol zastavený na pokyn používateľa v asistentskom chate.";
+    commandAction = "CANCEL_CASE";
+    commandKey = `assistant-cancel:${collectionCase.id}:${collectionCase.updatedAt.toISOString()}`;
+    shouldEnqueueCommand = Boolean(collectionCase.confirmedAt || collectionCase.workflowId);
+    resultKind = "CASE_CANCELLED";
+  } else {
+    return { kind: "NONE" };
+  }
+
+  const changed = await prisma.case.updateMany({
+    where: {
+      id: collectionCase.id,
+      organizationId: collectionCase.organizationId,
+      updatedAt: collectionCase.updatedAt
+    },
+    data: update
+  });
+  if (changed.count !== 1) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Prípad sa medzitým zmenil. Obnovte detail a skúste pokyn znova."
+    };
+  }
+
+  await prisma.$transaction([
+    prisma.caseEvent.create({
+      data: {
+        caseId: collectionCase.id,
+        actorType: "USER",
+        actorId: input.actorUserId,
+        type: eventType,
+        note,
+        payload: {
+          communicationId: input.communicationId,
+          intent: input.classification.intent,
+          source: "ASSISTANT_CHAT"
+        }
+      }
+    }),
+    ...(shouldEnqueueCommand
+      ? [
+          prisma.workflowCommand.upsert({
+            where: { idempotencyKey: commandKey },
+            create: {
+              caseId: collectionCase.id,
+              organizationId: collectionCase.organizationId,
+              type: WORKFLOW_COMMAND_TYPES.caseStateChanged,
+              idempotencyKey: commandKey,
+              payload: {
+                status: update.status ?? status,
+                source: "ASSISTANT_CHAT",
+                action: commandAction
+              }
+            },
+            update: {}
+          })
+        ]
+      : [])
+  ]);
+
+  return { kind: resultKind };
+}
+
+function resolveDirectResumeActionAt(collectionCase: {
+  status: string;
+  dueDate: Date | null;
+  nextActionAt: Date | null;
+}): Date | null {
+  if (collectionCase.nextActionAt) {
+    return collectionCase.nextActionAt;
+  }
+  if (collectionCase.status === "WAITING_FOR_DUE_DATE") {
+    return collectionCase.dueDate;
+  }
+  if (
+    collectionCase.status === "EMAIL_REMINDER_1_SENT" ||
+    collectionCase.status === "PAYMENT_PROMISED" ||
+    collectionCase.status === "OVERDUE"
+  ) {
+    return new Date();
+  }
+  return null;
 }
 
 async function confirmCaseFromCustomerEmail(
@@ -874,6 +1222,7 @@ async function sendStandardInstallmentProposalFromCustomer(input: {
     invoiceNumber: string | null;
     amountTotal: Prisma.Decimal | null;
     currency: string | null;
+    dueDate: Date | null;
     debtor: { id: string; name: string; email: string | null } | null;
   };
   communicationId: string | null;
@@ -925,7 +1274,10 @@ async function sendStandardInstallmentProposalFromCustomer(input: {
         "Štandardný splátkový kalendár možno ponúknuť až po začatí inkasného prípadu alebo po reakcii dlžníka."
     };
   }
-  if (collectionCase.status !== "MANUAL_REVIEW_REQUIRED") {
+  if (
+    collectionCase.status !== "MANUAL_REVIEW_REQUIRED" &&
+    collectionCase.status !== "INSTALLMENT_PLAN_SENT"
+  ) {
     assertCaseTransition(collectionCase.status as CaseStatus, "INSTALLMENT_PLAN_SENT");
   }
 
@@ -1055,12 +1407,241 @@ async function sendStandardInstallmentProposalFromCustomer(input: {
   return { kind: "INSTALLMENT_PROPOSAL_SENT" };
 }
 
+async function sendCustomInstallmentProposalFromCustomer(input: {
+  deps: CustomerEmailAssistantDependencies;
+  collectionCase: {
+    id: string;
+    organizationId: string;
+    status: string;
+    confirmedAt: Date | null;
+    invoiceNumber: string | null;
+    amountTotal: Prisma.Decimal | null;
+    currency: string | null;
+    dueDate: Date | null;
+    debtor: { id: string; name: string; email: string | null } | null;
+  };
+  classification: CustomerMessageClassification;
+  communicationId: string | null;
+}): Promise<CustomerAssistantActionResult> {
+  const collectionCase = input.collectionCase;
+  if (!collectionCase.confirmedAt) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Pred ponukou splátkového kalendára musí byť prípad spustený."
+    };
+  }
+  if (!collectionCase.amountTotal) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Prípad nemá zadanú sumu dlhu."
+    };
+  }
+  const debtorEmail = cleanText(collectionCase.debtor?.email);
+  if (!debtorEmail) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Pri dlžníkovi chýba emailová adresa."
+    };
+  }
+
+  const existing = await prisma.installmentPlan.findFirst({
+    where: {
+      caseId: collectionCase.id,
+      status: { in: ["PROPOSED", "ACTIVE"] }
+    },
+    include: { payments: { orderBy: { sequence: "asc" } } }
+  });
+  if (existing?.status === "ACTIVE") {
+    return { kind: "INSTALLMENT_PROPOSAL_ALREADY_EXISTS" };
+  }
+
+  const scheduleInput = resolveCustomInstallmentPlanInput(input.classification);
+  if (!scheduleInput) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason:
+        "Pri vlastnom splátkovom kalendári chýba počet splátok alebo konkrétne sumy."
+    };
+  }
+
+  let schedule: ReturnType<typeof calculateCustomInstallmentSchedule>;
+  try {
+    schedule = calculateCustomInstallmentSchedule(
+      Number(collectionCase.amountTotal),
+      new Date(),
+      scheduleInput
+    );
+  } catch (error) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason:
+        error instanceof Error
+          ? error.message
+          : "Vlastný splátkový kalendár sa nedá vypočítať."
+    };
+  }
+
+  const allowedStatuses: CaseStatus[] = [
+    "MANUAL_REVIEW_REQUIRED",
+    "OVERDUE",
+    "EMAIL_REMINDER_1_SENT",
+    "EMAIL_REMINDER_2_SENT",
+    "PAYMENT_PROMISED",
+    "INSTALLMENT_REQUESTED",
+    "INSTALLMENT_PLAN_SENT",
+    "FINAL_NOTICE_SENT"
+  ];
+  if (!allowedStatuses.includes(collectionCase.status as CaseStatus)) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason:
+        "Vlastný splátkový kalendár možno ponúknuť až po začatí inkasného prípadu alebo po reakcii dlžníka."
+    };
+  }
+  if (collectionCase.status !== "MANUAL_REVIEW_REQUIRED") {
+    assertCaseTransition(collectionCase.status as CaseStatus, "INSTALLMENT_PLAN_SENT");
+  }
+
+  const idempotencyKey = `customer-custom-installment-proposal:${collectionCase.id}:${input.communicationId ?? "manual"}`;
+  const from = process.env.SES_FROM_EMAIL || "system@example.com";
+  const replyTo = createCaseReplyAddress(
+    { caseId: collectionCase.id, domain: inboundReplyDomain() },
+    requireInboundReplyTokenSecret()
+  );
+  const invoiceNumber = collectionCase.invoiceNumber ?? collectionCase.id;
+  const currency = collectionCase.currency ?? "EUR";
+  const template = buildInstallmentProposal({
+    invoiceNumber,
+    currency,
+    payments: schedule.map(installmentTemplateRow),
+    description: "veriteľom schválený splátkový kalendár"
+  });
+
+  const created = await prisma.$transaction(async (tx) => {
+    if (existing?.status === "PROPOSED") {
+      await tx.installmentPlan.update({
+        where: { id: existing.id },
+        data: { status: "REJECTED" }
+      });
+    }
+    const plan = await tx.installmentPlan.create({
+      data: {
+        caseId: collectionCase.id,
+        sourceCommunicationId: input.communicationId,
+        totalAmount: collectionCase.amountTotal!,
+        currency,
+        payments: {
+          create: schedule.map((payment) => ({
+            sequence: payment.sequence,
+            amount: payment.amount,
+            dueDate: payment.dueDate
+          }))
+        }
+      },
+      include: { payments: { orderBy: { sequence: "asc" } } }
+    });
+    await tx.case.update({
+      where: { id: collectionCase.id },
+      data: {
+        status: "INSTALLMENT_PLAN_SENT",
+        nextActionAt: null,
+        automationPausedAt: null,
+        automationPauseReason: null
+      }
+    });
+    await tx.caseEvent.create({
+      data: {
+        caseId: collectionCase.id,
+        actorType: "AI",
+        type: CASE_EVENT_TYPES.installmentProposed,
+        note: "Customer authorized a custom installment proposal.",
+        payload: {
+          communicationId: input.communicationId,
+          replacedPlanId: existing?.status === "PROPOSED" ? existing.id : null,
+          planId: plan.id,
+          payments: schedule.map((payment) => ({
+            sequence: payment.sequence,
+            amount: payment.amount,
+            dueDate: payment.dueDate.toISOString()
+          }))
+        }
+      }
+    });
+    const communication = await tx.communication.create({
+      data: {
+        caseId: collectionCase.id,
+        direction: "OUTBOUND",
+        channel: "EMAIL",
+        status: "DRAFT",
+        idempotencyKey,
+        fromAddress: from,
+        toAddress: debtorEmail,
+        subject: template.subject,
+        textBody: template.textBody,
+        htmlBody: template.htmlBody,
+        rawPayload: {
+          kind: "customer-authorized-custom-installment-proposal",
+          replyTo,
+          planId: plan.id,
+          replacedPlanId: existing?.status === "PROPOSED" ? existing.id : null,
+          sourceCommunicationId: input.communicationId
+        }
+      },
+      select: { id: true }
+    });
+    return { planId: plan.id, communicationId: communication.id };
+  });
+
+  const sent = await input.deps.email.sendEmail({
+    from,
+    to: [debtorEmail],
+    replyTo: [replyTo],
+    subject: template.subject,
+    textBody: template.textBody,
+    htmlBody: template.htmlBody,
+    metadata: {
+      caseId: collectionCase.id,
+      kind: "custom-installment-proposal"
+    }
+  });
+
+  await prisma.$transaction([
+    prisma.communication.update({
+      where: { id: created.communicationId },
+      data: {
+        status: "SENT",
+        provider: sent.provider,
+        providerId: sent.providerId,
+        messageId: normalizeMessageId(sent.providerId),
+        sentAt: new Date()
+      }
+    }),
+    prisma.caseEvent.create({
+      data: {
+        caseId: collectionCase.id,
+        actorType: "SYSTEM",
+        type: CASE_EVENT_TYPES.emailSent,
+        note: `Custom installment proposal sent to ${debtorEmail}.`,
+        payload: {
+          communicationId: created.communicationId,
+          planId: created.planId
+        }
+      }
+    })
+  ]);
+
+  return { kind: "CUSTOM_INSTALLMENT_PROPOSAL_SENT" };
+}
+
 async function sendCustomerAuthorizedDebtorMessage(input: {
   deps: CustomerEmailAssistantDependencies;
   collectionCase: {
     id: string;
     organizationId: string;
     invoiceNumber: string | null;
+    amountTotal: Prisma.Decimal | null;
+    currency: string | null;
+    dueDate: Date | null;
     debtor: { id: string; name: string; email: string | null } | null;
   };
   classification: CustomerMessageClassification;
@@ -1093,7 +1674,8 @@ async function sendCustomerAuthorizedDebtorMessage(input: {
     input.collectionCase.invoiceNumber ?? input.collectionCase.id;
   const template = buildCustomerAuthorizedDebtorMessage({
     invoiceNumber,
-    message
+    message,
+    invoiceData: invoiceSummaryFromAssistantCase(input.collectionCase)
   });
   const idempotencyKey = `customer-authorized-debtor-message:${input.collectionCase.id}:${input.communicationId ?? "manual"}`;
   const communication =
@@ -1168,6 +1750,165 @@ async function sendCustomerAuthorizedDebtorMessage(input: {
   return { kind: "DEBTOR_MESSAGE_SENT" };
 }
 
+async function sendFinalNoticeFromCustomer(input: {
+  deps: CustomerEmailAssistantDependencies;
+  collectionCase: {
+    id: string;
+    organizationId: string;
+    status: string;
+    invoiceNumber: string | null;
+    amountTotal: Prisma.Decimal | null;
+    currency: string | null;
+    dueDate: Date | null;
+    debtor: { id: string; name: string; email: string | null } | null;
+  };
+  communicationId: string | null;
+}): Promise<CustomerAssistantActionResult> {
+  const collectionCase = input.collectionCase;
+  if (collectionCase.status === "FINAL_NOTICE_SENT" || collectionCase.status === "READY_FOR_LEGAL_ACTION") {
+    return { kind: "FINAL_NOTICE_ALREADY_SENT" };
+  }
+  if (TERMINAL_CASE_STATUSES.includes(collectionCase.status as CaseStatus)) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Uzavretému prípadu už nemožno odoslať poslednú výzvu."
+    };
+  }
+  if (!collectionCase.amountTotal) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Prípad nemá zadanú sumu dlhu."
+    };
+  }
+  const debtorEmail = cleanText(collectionCase.debtor?.email);
+  if (!debtorEmail) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason: "Pri dlžníkovi chýba emailová adresa."
+    };
+  }
+  const allowedStatuses: CaseStatus[] = [
+    "OVERDUE",
+    "EMAIL_REMINDER_1_SENT",
+    "EMAIL_REMINDER_2_SENT",
+    "PAYMENT_PROMISED",
+    "INSTALLMENT_REQUESTED",
+    "INSTALLMENT_PLAN_SENT",
+    "INSTALLMENT_BROKEN",
+    "MANUAL_REVIEW_REQUIRED"
+  ];
+  if (!allowedStatuses.includes(collectionCase.status as CaseStatus)) {
+    return {
+      kind: "ACTION_BLOCKED",
+      reason:
+        "Poslednú výzvu možno odoslať až pri otvorenom inkasnom prípade po splatnosti alebo po reakcii dlžníka."
+    };
+  }
+  assertCaseTransition(collectionCase.status as CaseStatus, "FINAL_NOTICE_SENT");
+
+  const invoiceNumber = collectionCase.invoiceNumber ?? collectionCase.id;
+  const creditorName = await resolveCreditorName(collectionCase.id, collectionCase.organizationId);
+  const template = buildFinalNotice({
+    invoiceNumber,
+    amountTotal: Number(collectionCase.amountTotal),
+    currency: collectionCase.currency ?? "EUR",
+    creditorName,
+    invoiceData: invoiceSummaryFromAssistantCase(collectionCase)
+  });
+  const from = process.env.SES_FROM_EMAIL || "system@example.com";
+  const replyTo = createCaseReplyAddress(
+    { caseId: collectionCase.id, domain: inboundReplyDomain() },
+    requireInboundReplyTokenSecret()
+  );
+  const idempotencyKey = `customer-final-notice:${collectionCase.id}:${input.communicationId ?? "manual"}`;
+  const communication =
+    (await prisma.communication.findUnique({
+      where: { idempotencyKey },
+      select: { id: true, status: true }
+    })) ??
+    (await prisma.communication.create({
+      data: {
+        caseId: collectionCase.id,
+        direction: "OUTBOUND",
+        channel: "EMAIL",
+        status: "DRAFT",
+        idempotencyKey,
+        fromAddress: from,
+        toAddress: debtorEmail,
+        subject: template.subject,
+        textBody: template.textBody,
+        htmlBody: template.htmlBody,
+        rawPayload: {
+          kind: "customer-authorized-final-notice",
+          replyTo,
+          sourceCommunicationId: input.communicationId
+        }
+      },
+      select: { id: true, status: true }
+    }));
+  if (communication.status === "SENT") {
+    return { kind: "FINAL_NOTICE_ALREADY_SENT" };
+  }
+
+  const sent = await input.deps.email.sendEmail({
+    from,
+    to: [debtorEmail],
+    replyTo: [replyTo],
+    subject: template.subject,
+    textBody: template.textBody,
+    htmlBody: template.htmlBody,
+    metadata: {
+      caseId: collectionCase.id,
+      kind: "final-notice"
+    }
+  });
+
+  await prisma.$transaction([
+    prisma.communication.update({
+      where: { id: communication.id },
+      data: {
+        status: "SENT",
+        provider: sent.provider,
+        providerId: sent.providerId,
+        messageId: normalizeMessageId(sent.providerId),
+        sentAt: new Date()
+      }
+    }),
+    prisma.case.update({
+      where: { id: collectionCase.id },
+      data: {
+        status: "FINAL_NOTICE_SENT",
+        nextActionAt: null,
+        automationPausedAt: null,
+        automationPauseReason: null
+      }
+    }),
+    prisma.caseEvent.create({
+      data: {
+        caseId: collectionCase.id,
+        actorType: "AI",
+        type: CASE_EVENT_TYPES.emailSent,
+        note: "Approved final notice sent to debtor by customer instruction.",
+        payload: {
+          communicationId: communication.id,
+          sourceCommunicationId: input.communicationId,
+          previousStatus: collectionCase.status
+        }
+      }
+    })
+  ]);
+
+  return { kind: "FINAL_NOTICE_SENT" };
+}
+
+async function resolveCreditorName(caseId: string, organizationId: string): Promise<string> {
+  const collectionCase = await prisma.case.findFirst({
+    where: { id: caseId, organizationId },
+    include: { customer: true }
+  });
+  return collectionCase?.customer?.name ?? "veriteľ";
+}
+
 function chooseCustomerAssistantReply(
   collectionCase: {
     id: string;
@@ -1179,18 +1920,27 @@ function chooseCustomerAssistantReply(
     currency: string | null;
     debtor: { name: string; email: string | null } | null;
     events?: Array<{ type: string; note: string | null; createdAt: Date }>;
+    installmentPlans?: Array<{
+      currency: string;
+      payments: Array<{ sequence: number; amount: Prisma.Decimal | number; dueDate: Date }>;
+    }>;
   },
   classification: CustomerMessageClassification,
   stillMissing: string[],
   actionResult: CustomerAssistantActionResult = { kind: "NONE" }
 ) {
+  const invoiceData = invoiceSummaryFromAssistantCase(collectionCase);
+  const installmentSchedule = installmentScheduleFromAssistantCase(collectionCase);
+  const installmentCurrency =
+    collectionCase.installmentPlans?.[0]?.currency ?? collectionCase.currency ?? "EUR";
   if (actionResult.kind === "CASE_CONFIRMED") {
     return buildCustomerAssistantAcknowledgement({
       invoiceNumber: collectionCase.invoiceNumber,
       summary:
         "Prípad sme potvrdili a spustili automatickú kontrolu splatnosti.",
       stillMissing: [],
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
     });
   }
 
@@ -1199,7 +1949,10 @@ function chooseCustomerAssistantReply(
       invoiceNumber: collectionCase.invoiceNumber,
       summary: "Prípad už bol spustený. Automatizácia pokračuje podľa aktuálneho stavu.",
       stillMissing: [],
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData,
+      installmentSchedule,
+      installmentCurrency
     });
   }
 
@@ -1209,7 +1962,23 @@ function chooseCustomerAssistantReply(
       summary:
         "Štandardný splátkový kalendár sme poslali dlžníkovi na výslovné potvrdenie.",
       stillMissing: [],
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData,
+      installmentSchedule,
+      installmentCurrency
+    });
+  }
+
+  if (actionResult.kind === "CUSTOM_INSTALLMENT_PROPOSAL_SENT") {
+    return buildCustomerAssistantAcknowledgement({
+      invoiceNumber: collectionCase.invoiceNumber,
+      summary:
+        "Vlastný splátkový kalendár sme podľa vášho pokynu poslali dlžníkovi na výslovné potvrdenie.",
+      stillMissing: [],
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData,
+      installmentSchedule,
+      installmentCurrency
     });
   }
 
@@ -1219,7 +1988,10 @@ function chooseCustomerAssistantReply(
       summary:
         "Splátkový kalendár už je k prípadu pripravený alebo aktívny.",
       stillMissing: [],
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData,
+      installmentSchedule,
+      installmentCurrency
     });
   }
 
@@ -1228,7 +2000,29 @@ function chooseCustomerAssistantReply(
       invoiceNumber: collectionCase.invoiceNumber,
       summary: "Správu sme podľa vášho pokynu odoslali dlžníkovi.",
       stillMissing: [],
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
+    });
+  }
+
+  if (actionResult.kind === "FINAL_NOTICE_SENT") {
+    return buildCustomerAssistantAcknowledgement({
+      invoiceNumber: collectionCase.invoiceNumber,
+      summary:
+        "Schválenú poslednú výzvu sme podľa vášho pokynu odoslali dlžníkovi.",
+      stillMissing: [],
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
+    });
+  }
+
+  if (actionResult.kind === "FINAL_NOTICE_ALREADY_SENT") {
+    return buildCustomerAssistantAcknowledgement({
+      invoiceNumber: collectionCase.invoiceNumber,
+      summary: "Posledná výzva už bola k tomuto prípadu odoslaná.",
+      stillMissing: [],
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
     });
   }
 
@@ -1243,13 +2037,15 @@ function chooseCustomerAssistantReply(
         invoiceNumber: collectionCase.invoiceNumber,
         requestedMessage,
         reason: legalOrSafetyBlockReason(classification),
-        dashboardUrl: dashboardUrl(collectionCase.id)
+        dashboardUrl: dashboardUrl(collectionCase.id),
+        invoiceData
       });
     }
     return buildCustomerActionNeedsConfirmation({
       invoiceNumber: collectionCase.invoiceNumber,
       requestedAction: actionResult.reason,
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
     });
   }
 
@@ -1264,7 +2060,8 @@ function chooseCustomerAssistantReply(
         invoiceNumber: collectionCase.invoiceNumber,
         requestedMessage,
         reason: legalOrSafetyBlockReason(classification),
-        dashboardUrl: dashboardUrl(collectionCase.id)
+        dashboardUrl: dashboardUrl(collectionCase.id),
+        invoiceData
       });
     }
     if (MUTATING_INTENTS.has(classification.intent)) {
@@ -1272,13 +2069,15 @@ function chooseCustomerAssistantReply(
         invoiceNumber: collectionCase.invoiceNumber,
         requestedAction:
           cleanText(classification.requestedAction) ?? classification.summary,
-        dashboardUrl: dashboardUrl(collectionCase.id)
+        dashboardUrl: dashboardUrl(collectionCase.id),
+        invoiceData
       });
     }
     return buildCustomerManualReviewEscalation({
       invoiceNumber: collectionCase.invoiceNumber,
       summary: classification.summary,
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
     });
   }
 
@@ -1294,7 +2093,9 @@ function chooseCustomerAssistantReply(
       dueDate: collectionCase.dueDate?.toISOString().slice(0, 10) ?? null,
       debtorName: collectionCase.debtor?.name ?? null,
       confirmUrl,
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      installmentSchedule,
+      installmentCurrency
     });
   }
 
@@ -1310,7 +2111,9 @@ function chooseCustomerAssistantReply(
       dueDate: collectionCase.dueDate?.toISOString().slice(0, 10) ?? null,
       debtorName: collectionCase.debtor?.name ?? null,
       recentEvents: summarizeRecentEvents(collectionCase.events ?? []),
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      installmentSchedule,
+      installmentCurrency
     });
   }
 
@@ -1329,7 +2132,9 @@ function chooseCustomerAssistantReply(
         dueDate: collectionCase.dueDate?.toISOString().slice(0, 10) ?? null,
         debtorName: collectionCase.debtor?.name ?? null,
         confirmUrl: readyConfirmUrl,
-        dashboardUrl: dashboardUrl(collectionCase.id)
+        dashboardUrl: dashboardUrl(collectionCase.id),
+        installmentSchedule,
+        installmentCurrency
       });
     }
   }
@@ -1342,7 +2147,9 @@ function chooseCustomerAssistantReply(
       currency: collectionCase.currency,
       dueDate: collectionCase.dueDate?.toISOString().slice(0, 10) ?? null,
       debtorName: collectionCase.debtor?.name ?? null,
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      installmentSchedule,
+      installmentCurrency
     });
   }
 
@@ -1350,7 +2157,8 @@ function chooseCustomerAssistantReply(
     return buildCustomerMissingFieldsFollowUp({
       invoiceNumber: collectionCase.invoiceNumber,
       stillMissing,
-      dashboardUrl: dashboardUrl(collectionCase.id)
+      dashboardUrl: dashboardUrl(collectionCase.id),
+      invoiceData
     });
   }
 
@@ -1358,7 +2166,10 @@ function chooseCustomerAssistantReply(
     invoiceNumber: collectionCase.invoiceNumber,
     summary: classification.summary,
     stillMissing,
-    dashboardUrl: dashboardUrl(collectionCase.id)
+    dashboardUrl: dashboardUrl(collectionCase.id),
+    invoiceData,
+    installmentSchedule,
+    installmentCurrency
   });
 }
 
@@ -1439,6 +2250,41 @@ function appBaseUrl(): string {
 
 function dashboardUrl(caseId: string): string {
   return `${appBaseUrl()}/?case=${encodeURIComponent(caseId)}`;
+}
+
+function invoiceSummaryFromAssistantCase(collectionCase: {
+  invoiceNumber: string | null;
+  amountTotal: Prisma.Decimal | number | null;
+  currency: string | null;
+  dueDate: Date | null;
+  debtor: { name: string | null } | null;
+}): InvoiceEmailSummary {
+  return {
+    invoiceNumber: collectionCase.invoiceNumber,
+    debtorName: collectionCase.debtor?.name ?? null,
+    amountTotal:
+      collectionCase.amountTotal === null
+        ? null
+        : Number(collectionCase.amountTotal),
+    currency: collectionCase.currency,
+    dueDate: collectionCase.dueDate?.toISOString().slice(0, 10) ?? null
+  };
+}
+
+function installmentScheduleFromAssistantCase(collectionCase: {
+  installmentPlans?: Array<{
+    payments: Array<{ sequence: number; amount: Prisma.Decimal | number; dueDate: Date }>;
+  }>;
+}): InstallmentScheduleRow[] | null {
+  const plan = collectionCase.installmentPlans?.[0];
+  if (!plan) {
+    return null;
+  }
+  return plan.payments.map((payment) => ({
+    sequence: payment.sequence,
+    amount: Number(payment.amount),
+    dueDate: payment.dueDate.toISOString().slice(0, 10)
+  }));
 }
 
 function customerAskedForReviewEmail(
@@ -1834,6 +2680,82 @@ function normalizeAmount(value: string): number | null {
   }
   const parsed = Number.parseFloat(match[0].replace(",", "."));
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function resolveCustomInstallmentPlanInput(
+  classification: CustomerMessageClassification
+): {
+  paymentCount: number;
+  firstPaymentAmount?: number | null;
+  paymentAmounts?: number[];
+  dueDates?: string[];
+} | null {
+  const plan = classification.requestedInstallmentPlan;
+  const paymentAmounts = plan.paymentAmounts.filter(
+    (amount) => Number.isFinite(amount) && amount > 0
+  );
+  const dueDates = plan.dueDates.filter((date) => parseIsoDate(date));
+  const paymentCount =
+    plan.paymentCount ??
+    (paymentAmounts.length >= 2 ? paymentAmounts.length : null) ??
+    extractRequestedPaymentCount(
+      `${classification.requestedAction ?? ""}\n${classification.replyDraft ?? ""}\n${classification.customerNote ?? ""}`
+    );
+
+  if (!paymentCount) {
+    return null;
+  }
+
+  return {
+    paymentCount,
+    firstPaymentAmount:
+      plan.firstPaymentAmount ??
+      extractFirstPaymentAmount(
+        `${classification.requestedAction ?? ""}\n${classification.replyDraft ?? ""}\n${classification.customerNote ?? ""}`
+      ),
+    paymentAmounts,
+    dueDates
+  };
+}
+
+function extractRequestedPaymentCount(value: string): number | null {
+  const normalized = value.toLowerCase();
+  const digit = normalized.match(
+    /(?:na|do|v|into|for|раздели(?:ть)?\s+на)\s+(\d{1,2})\s*(?:spl[aá]tk|payment|платеж|платёж)/u
+  );
+  if (digit) {
+    return Number(digit[1]);
+  }
+  const words: Record<string, number> = {
+    dve: 2,
+    dva: 2,
+    tri: 3,
+    styri: 4,
+    štyri: 4,
+    pat: 5,
+    päť: 5,
+    five: 5,
+    пять: 5
+  };
+  for (const [word, count] of Object.entries(words)) {
+    if (
+      normalized.includes(`${word} spl`) ||
+      normalized.includes(`${word} plat`) ||
+      normalized.includes(`${word} платеж`) ||
+      normalized.includes(`${word} платёж`)
+    ) {
+      return count;
+    }
+  }
+  return null;
+}
+
+function extractFirstPaymentAmount(value: string): number | null {
+  const normalized = value.toLowerCase();
+  const match = normalized.match(
+    /(?:prv[aá]|first|первы[йя]|1\.?)\s+(?:spl[aá]tka|payment|oplat|оплат[ауы]|плат[её]ж)[^\d]*(\d+(?:[,.]\d{1,2})?)/u
+  );
+  return match ? Number(match[1].replace(",", ".")) : null;
 }
 
 function inboundReplyDomain(): string {

@@ -44,6 +44,7 @@ export type DashboardEvent = {
   actorType: string;
   note: string | null;
   createdAt: string;
+  payload?: unknown | null;
 };
 
 export type DashboardCommunication = {
@@ -58,6 +59,9 @@ export type DashboardCommunication = {
   sentAt: string | null;
   receivedAt: string | null;
   attachmentCount: number;
+  kind?: string | null;
+  aiIntent?: string | null;
+  aiSummary?: string | null;
 };
 
 export type DashboardCase = {
@@ -204,7 +208,8 @@ export function toDashboardCase(
       type: event.type,
       actorType: event.actorType,
       note: event.note,
-      createdAt: event.createdAt.toISOString()
+      createdAt: event.createdAt.toISOString(),
+      payload: event.payload ?? null
     })),
     communications: (detail.communications ?? []).map((communication) => ({
       id: communication.id,
@@ -217,7 +222,10 @@ export function toDashboardCase(
       createdAt: communication.createdAt.toISOString(),
       sentAt: communication.sentAt?.toISOString() ?? null,
       receivedAt: communication.receivedAt?.toISOString() ?? null,
-      attachmentCount: communication.attachments.length
+      attachmentCount: communication.attachments.length,
+      kind: stringFromRecord(asRecord(communication.rawPayload), "kind"),
+      aiIntent: stringFromRecord(asRecord(communication.aiClassification), "intent"),
+      aiSummary: stringFromRecord(asRecord(communication.aiClassification), "summary")
     })),
     paymentPromises: item.paymentPromises.map((promise) => ({
       id: promise.id,

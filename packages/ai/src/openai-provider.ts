@@ -3,12 +3,16 @@ import { zodTextFormat } from "openai/helpers/zod";
 import {
   AiProvider,
   CaseSummaryInput,
+  CustomerDecisionEmailInput,
   CustomerMessageInput,
+  DashboardCaseAssistantInput,
   DebtorReplyInput,
   GenerateEmailInput,
   InvoiceEmailAttachmentTriageInput,
   InvoiceExtractionInput,
   customerMessageClassificationSchema,
+  customerDecisionEmailDraftSchema,
+  dashboardCaseAssistantReplySchema,
   debtorReplyClassificationSchema,
   invoiceEmailAttachmentTriageResultSchema,
   invoiceExtractionResultSchema
@@ -148,7 +152,7 @@ export class OpenAiProvider implements AiProvider {
         {
           role: "system",
           content:
-            "Classify debtor replies for a Slovak soft-collection workflow. Distinguish payment claims, concrete payment promises, disputes, installment requests, explicit acceptance or rejection of a previously proposed installment schedule, automated replies, and unclear messages. explicitInstallmentAcceptance may be true only when the debtor unambiguously accepts all proposed dates and amounts shown in the case summary. Extract a mentioned payment amount only when explicit. Never approve discounts, legal action, or non-standard terms. Return structured classification only."
+            "Classify debtor replies for a Slovak soft-collection workflow. Distinguish payment claims, concrete payment promises, disputes, installment requests, explicit acceptance or rejection of a previously proposed installment schedule, automated replies, and unclear messages. explicitInstallmentAcceptance may be true only when the debtor unambiguously accepts all proposed dates and amounts shown in the case summary. Extract a mentioned payment amount only when explicit. If the debtor asks for a concrete number of installments, set requestedInstallmentCount. Never approve discounts, legal action, or non-standard terms. Return structured classification only."
         },
         {
           role: "user",
@@ -180,7 +184,7 @@ export class OpenAiProvider implements AiProvider {
         {
           role: "system",
           content:
-            "Classify messages from a FAKTURIO customer account user in Slovak, Czech, English or Russian. The customer may clarify invoice fields, add a note, ask for case status/history, update missing debtor contact details, confirm/start a reviewed invoice case, approve the predefined standard installment plan, request a custom installment proposal, or ask to send an additional message to the debtor. Map phrases like 'spusti pripad', 'potvrdzujem fakturu', 'start case', 'запусти дело' to REQUEST_CONFIRM_INVOICE. Map phrases like 'standardne splatky', 'suma/3', 'standard installment plan', 'стандартная рассрочка' to REQUEST_STANDARD_INSTALLMENT_PLAN only when the customer asks to use the predefined standard three-payment plan. Map explicit non-standard payment schedule instructions to REQUEST_CUSTOM_INSTALLMENT_PLAN. Map 'napíšte dlžníkovi...', 'pošlite mu...', 'send debtor...' to REQUEST_SEND_DEBTOR_MESSAGE and put the exact debtor-facing draft in replyDraft when possible. Extract only explicit facts. Do not invent invoice values. Never approve legal action, discounts, debt amount changes, payment receipt, cancellation, pause or resume. Mark legal threats, discounts, debt amount reductions, contradictory, or low-certainty requests as needsHumanReview. Return structured classification only."
+            "Classify messages from a FAKTURIO customer account user in Slovak, Czech, English or Russian. The customer may clarify invoice fields, add a note, ask for case status/history, update missing debtor contact details, confirm/start a reviewed invoice case, approve the predefined standard installment plan, request a custom installment proposal, ask to send an additional message to the debtor, or request the approved final notice before legal review. Map phrases like 'spusti pripad', 'potvrdzujem fakturu', 'start case', 'запусти дело' to REQUEST_CONFIRM_INVOICE. Map phrases like 'standardne splatky', 'suma/3', 'standard installment plan', 'стандартная рассрочка' to REQUEST_STANDARD_INSTALLMENT_PLAN only when the customer asks to use the predefined standard three-payment plan. Map explicit non-standard payment schedule instructions to REQUEST_CUSTOM_INSTALLMENT_PLAN. For custom installment plans, fill requestedInstallmentPlan: paymentCount when the user asks for a number of payments, firstPaymentAmount when the first payment amount is explicit, paymentAmounts/dueDates only when every amount/date is explicitly provided. Map 'napíšte dlžníkovi...', 'pošlite mu...', 'send debtor...' to REQUEST_SEND_DEBTOR_MESSAGE and put the exact debtor-facing draft in replyDraft when possible. Map requests to send an approved final/pre-legal notice, reserve rights to court recovery, ask whether refusal to pay is final, or move toward legal review to REQUEST_FINAL_NOTICE. Extract only explicit facts. Do not invent invoice values. Never approve discounts, debt amount changes, payment receipt, cancellation, pause or resume. Mark arbitrary legal threats, discounts, debt amount reductions, contradictory, or low-certainty requests as needsHumanReview. The approved final notice request is not arbitrary legal drafting; classify it as REQUEST_FINAL_NOTICE. Return structured classification only."
         },
         {
           role: "user",
@@ -206,6 +210,95 @@ export class OpenAiProvider implements AiProvider {
     );
     if (!parsed) {
       throw new Error("OpenAI response did not contain customer message classification.");
+    }
+
+    return parsed;
+  }
+
+  async answerDashboardCaseMessage(input: DashboardCaseAssistantInput) {
+    const response = await this.client.responses.parse({
+      model: this.model,
+      store: false,
+      temperature: 0.2,
+      input: [
+        {
+          role: "system",
+          content:
+            "You are the FAKTURIO dashboard case assistant for an authenticated customer user. Answer conversationally in the user's language. Use only the supplied case snapshot, recent events, and recent communications; do not invent facts. Do not expose raw internal status codes, payload JSON, implementation details, or English audit notes. Translate statuses and events into plain language. If the user asks what happened, explain the chronological story. If the user asks why attention is needed, explain the concrete blocker, especially automation pause reason and latest debtor reply. If the debtor replied, summarize the latest debtor inbound message and include only a short necessary excerpt. If the user asks what to do next, give practical options based on allowedActions. Guardrails: never change debt amount, approve discounts, accept non-standard legal terms, file legal action, or draft arbitrary legal threats. You may mention that the system can send only an approved final notice template, propose the standard installment plan, send a neutral debtor message, pause/resume, mark paid, or cancel when allowed. If an action is not possible, say why and where the user can handle it manually. Return structured output only."
+        },
+        {
+          role: "user",
+          content: [
+            `User language: ${input.userLanguage}`,
+            `User message:\n${input.userMessage}`,
+            `Case snapshot:\n${JSON.stringify(input.caseSnapshot, null, 2)}`,
+            `Allowed actions:\n${input.allowedActions.join(", ") || "(none)"}`,
+            `Recent events:\n${JSON.stringify(input.recentEvents, null, 2)}`,
+            `Recent communications:\n${JSON.stringify(input.recentCommunications, null, 2)}`
+          ].join("\n\n")
+        }
+      ],
+      text: {
+        format: zodTextFormat(
+          dashboardCaseAssistantReplySchema,
+          "dashboard_case_assistant_reply"
+        )
+      }
+    });
+
+    const parsed = extractParsedResponse(
+      response,
+      dashboardCaseAssistantReplySchema.safeParse.bind(dashboardCaseAssistantReplySchema)
+    );
+    if (!parsed) {
+      throw new Error("OpenAI response did not contain dashboard case assistant reply.");
+    }
+
+    return parsed;
+  }
+
+  async draftCustomerDecisionEmail(input: CustomerDecisionEmailInput) {
+    const response = await this.client.responses.parse({
+      model: this.model,
+      store: false,
+      temperature: 0.3,
+      input: [
+        {
+          role: "system",
+          content:
+            "You write customer-facing FAKTURIO emails in Slovak when an automated invoice collection case is paused and needs the customer's decision. Write naturally and clearly, not as a raw template. Use only supplied facts. Explain what the debtor wrote, why automation paused, and what the customer can answer directly to this email. Include the dashboard link. Do not claim that any new action was already performed. Do not draft arbitrary legal threats, legal advice, discounts, debt changes, or non-standard terms. You may mention an approved final notice option only as an available predefined action. Return structured output only."
+        },
+        {
+          role: "user",
+          content: [
+            `Case ID: ${input.caseId}`,
+            `Invoice number: ${input.invoiceNumber}`,
+            `Debtor: ${input.debtorName ?? "(unknown)"}`,
+            `Amount: ${input.amountTotal ?? "(unknown)"} ${input.currency ?? "EUR"}`,
+            `Due date: ${input.dueDate ?? "(unknown)"}`,
+            `Decision reason:\n${input.decisionReason}`,
+            `AI classification summary:\n${input.classificationSummary ?? "(none)"}`,
+            `Debtor message:\n${input.debtorMessage ?? "(no readable text)"}`,
+            `Customer can reply to: ${input.replyToAddress}`,
+            `Dashboard link: ${input.caseUrl}`,
+            `Allowed customer replies/actions:\n- ${input.allowedReplies.join("\n- ")}`
+          ].join("\n\n")
+        }
+      ],
+      text: {
+        format: zodTextFormat(
+          customerDecisionEmailDraftSchema,
+          "customer_decision_email_draft"
+        )
+      }
+    });
+
+    const parsed = extractParsedResponse(
+      response,
+      customerDecisionEmailDraftSchema.safeParse.bind(customerDecisionEmailDraftSchema)
+    );
+    if (!parsed) {
+      throw new Error("OpenAI response did not contain customer decision email draft.");
     }
 
     return parsed;

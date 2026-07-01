@@ -26,7 +26,10 @@ export type ReplyPolicyDecision =
   | { kind: "PAUSE_DISPUTE" }
   | {
       kind: "PAUSE_MANUAL_REVIEW";
-      reason: "AMOUNT_MISMATCH" | "SENDER_MISMATCH";
+      reason:
+        | "AMOUNT_MISMATCH"
+        | "SENDER_MISMATCH"
+        | "NON_STANDARD_INSTALLMENT_TERMS";
     }
   | { kind: "REQUEST_CLARIFICATION" }
   | { kind: "PAUSE_UNCLEAR" };
@@ -84,6 +87,18 @@ export function decideDebtorReply(input: ReplyPolicyInput): ReplyPolicyDecision 
         )
       };
     case "INSTALLMENT_REQUEST":
+      const requestedCount =
+        input.classification.requestedInstallmentCount ??
+        extractInstallmentCount(input.classification.summary);
+      if (
+        input.hasProposedInstallmentPlan ||
+        (requestedCount !== null && requestedCount !== 3)
+      ) {
+        return {
+          kind: "PAUSE_MANUAL_REVIEW",
+          reason: "NON_STANDARD_INSTALLMENT_TERMS"
+        };
+      }
       return { kind: "PROPOSE_INSTALLMENT" };
     case "INSTALLMENT_ACCEPTED":
       return input.hasProposedInstallmentPlan &&
@@ -120,6 +135,152 @@ export function calculateInstallmentSchedule(
     amount: amounts[index] / 100,
     dueDate: addUtcDays(startOfUtcDay(acceptedFrom), days)
   }));
+}
+
+export function calculateCustomInstallmentSchedule(
+  totalAmount: number,
+  acceptedFrom: Date,
+  input: {
+    paymentCount: number;
+    firstPaymentAmount?: number | null;
+    paymentAmounts?: number[];
+    dueDates?: string[];
+  }
+): Array<{ sequence: number; amount: number; dueDate: Date }> {
+  if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+    throw new Error("Installment total must be a positive amount.");
+  }
+  if (!Number.isInteger(input.paymentCount) || input.paymentCount < 2 || input.paymentCount > 24) {
+    throw new Error("Custom installment count must be between 2 and 24.");
+  }
+
+  const amounts = resolveInstallmentAmounts(
+    totalAmount,
+    input.paymentCount,
+    input.firstPaymentAmount ?? null,
+    input.paymentAmounts ?? []
+  );
+  const dueDates = resolveInstallmentDueDates(
+    acceptedFrom,
+    input.paymentCount,
+    input.dueDates ?? []
+  );
+
+  return amounts.map((amount, index) => ({
+    sequence: index + 1,
+    amount,
+    dueDate: dueDates[index]
+  }));
+}
+
+function resolveInstallmentAmounts(
+  totalAmount: number,
+  paymentCount: number,
+  firstPaymentAmount: number | null,
+  explicitAmounts: number[]
+): number[] {
+  const totalCents = Math.round(totalAmount * 100);
+  if (explicitAmounts.length > 0) {
+    if (explicitAmounts.length !== paymentCount) {
+      throw new Error("Explicit installment amounts must match the payment count.");
+    }
+    const cents = explicitAmounts.map((amount) => {
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error("Installment amounts must be positive.");
+      }
+      return Math.round(amount * 100);
+    });
+    const sum = cents.reduce((acc, amount) => acc + amount, 0);
+    if (sum !== totalCents) {
+      throw new Error("Explicit installment amounts must sum to the total amount.");
+    }
+    return cents.map((amount) => amount / 100);
+  }
+
+  if (firstPaymentAmount !== null) {
+    const firstCents = Math.round(firstPaymentAmount * 100);
+    if (firstCents <= 0 || firstCents >= totalCents) {
+      throw new Error("First installment amount must be lower than the total amount.");
+    }
+    const restCount = paymentCount - 1;
+    const restTotal = totalCents - firstCents;
+    const baseRest = Math.floor(restTotal / restCount);
+    return [
+      firstCents,
+      ...Array.from({ length: restCount }, (_, index) =>
+        index === restCount - 1
+          ? restTotal - baseRest * (restCount - 1)
+          : baseRest
+      )
+    ].map((amount) => amount / 100);
+  }
+
+  const base = Math.floor(totalCents / paymentCount);
+  return Array.from({ length: paymentCount }, (_, index) =>
+    index === paymentCount - 1
+      ? totalCents - base * (paymentCount - 1)
+      : base
+  ).map((amount) => amount / 100);
+}
+
+function resolveInstallmentDueDates(
+  acceptedFrom: Date,
+  paymentCount: number,
+  explicitDueDates: string[]
+): Date[] {
+  if (explicitDueDates.length > 0) {
+    if (explicitDueDates.length !== paymentCount) {
+      throw new Error("Explicit installment dates must match the payment count.");
+    }
+    return explicitDueDates.map((value) => {
+      const parsed = parseIsoDate(value);
+      if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= acceptedFrom.getTime()) {
+        throw new Error("Installment dates must be valid future ISO dates.");
+      }
+      return parsed;
+    });
+  }
+
+  const start = startOfUtcDay(acceptedFrom);
+  return Array.from({ length: paymentCount }, (_, index) =>
+    addUtcDays(start, 5 + index * 14)
+  );
+}
+
+function extractInstallmentCount(value: string): number | null {
+  const normalized = value.toLowerCase();
+  const digit = normalized.match(
+    /\b(\d{1,2})\s*(?:installments?|spl[aá]tok|spl[aá]tky|payments?|платеж|платёж)/u
+  );
+  if (digit) {
+    return Number(digit[1]);
+  }
+  const words: Record<string, number> = {
+    two: 2,
+    dve: 2,
+    dva: 2,
+    три: 3,
+    tri: 3,
+    three: 3,
+    four: 4,
+    styri: 4,
+    štyri: 4,
+    five: 5,
+    pat: 5,
+    päť: 5,
+    пять: 5
+  };
+  for (const [word, count] of Object.entries(words)) {
+    if (
+      normalized.includes(`${word} installment`) ||
+      normalized.includes(`${word} spl`) ||
+      normalized.includes(`${word} payment`) ||
+      normalized.includes(`${word} плат`)
+    ) {
+      return count;
+    }
+  }
+  return null;
 }
 
 function cappedPromiseDate(value: string | null, receivedAt: Date): Date {

@@ -4,6 +4,7 @@ import { createAiProvider } from "@fakturio/ai";
 import { prisma } from "@fakturio/db";
 import {
   buildClarificationRequest,
+  buildCustomerDebtorReplyDecisionAssistantRequest,
   buildCustomerDebtorReplyDecisionRequest,
   buildCustomerExceptionNotice,
   buildDebtorInvoiceCopy,
@@ -17,8 +18,13 @@ import {
   buildPaymentClaimAcknowledgement,
   buildSecondReminder,
   createEmailProvider,
+  formatEmailDate,
+  formatEmailMoney,
   isPermanentEmailProviderError,
-  type CollectionTemplate
+  renderEmailDocument,
+  type CollectionTemplate,
+  type InstallmentScheduleRow,
+  type InvoiceEmailSummary
 } from "@fakturio/email";
 import {
   CASE_EVENT_TYPES,
@@ -171,7 +177,8 @@ export const activities: CaseWorkflowActivities = {
         invoiceNumber: collectionCase.invoiceNumber!,
         amountTotal: Number(collectionCase.amountTotal),
         currency: collectionCase.currency ?? "EUR",
-        creditorName
+        creditorName,
+        invoiceData: invoiceSummaryFromCase(collectionCase)
       });
       expectedStatuses = ["EMAIL_REMINDER_1_SENT", "PAYMENT_PROMISED"];
       nextStatus = "EMAIL_REMINDER_2_SENT";
@@ -332,7 +339,16 @@ export const activities: CaseWorkflowActivities = {
         "nezistený dátum",
       installmentSequence: installmentPayment?.sequence ?? null,
       paidUrl,
-      notPaidUrl
+      notPaidUrl,
+      invoiceData: invoiceSummaryFromCase(collectionCase),
+      installmentSchedule: installmentScheduleFromPlan(
+        collectionCase.installmentPlans[0] ?? null
+      ),
+      installmentCurrency:
+        collectionCase.installmentPlans[0]?.currency ??
+        paymentCheck.currency ??
+        collectionCase.currency ??
+        "EUR"
     });
 
     try {
@@ -548,7 +564,8 @@ export const activities: CaseWorkflowActivities = {
           missedSequence: installment.sequence,
           missedAmount: Number(installment.amount),
           currency: installment.plan.currency,
-          remainingAmount
+          remainingAmount,
+          payments: installment.plan.payments.map(installmentTemplateRow)
         }),
         metadata: {
           caseId: collectionCase.id,
@@ -762,10 +779,14 @@ async function applyReplyDecision(input: {
       "INSTALLMENT_ACTIVE"
     );
     const acceptedAt = new Date();
-    const activatedPayments = calculateInstallmentSchedule(
-      Number(plan.totalAmount),
-      acceptedAt
-    );
+    const activatedPayments = plan.payments.map((payment) => ({
+      sequence: payment.sequence,
+      amount: Number(payment.amount),
+      dueDate: payment.dueDate
+    }));
+    if (activatedPayments.length === 0) {
+      throw new Error(`Installment plan ${plan.id} has no payments.`);
+    }
     await prisma.$transaction(async (tx) => {
       const activated = await tx.installmentPlan.updateMany({
         where: { id: plan.id, caseId: collectionCase.id, status: "PROPOSED" },
@@ -773,17 +794,6 @@ async function applyReplyDecision(input: {
       });
       if (activated.count !== 1) {
         throw new Error(`Installment plan ${plan.id} is no longer proposed.`);
-      }
-      for (const payment of activatedPayments) {
-        await tx.installmentPayment.update({
-          where: {
-            planId_sequence: {
-              planId: plan.id,
-              sequence: payment.sequence
-            }
-          },
-          data: { dueDate: payment.dueDate }
-        });
       }
       const changed = await tx.case.updateMany({
         where: {
@@ -807,7 +817,7 @@ async function applyReplyDecision(input: {
           caseId: collectionCase.id,
           actorType: "WORKFLOW",
           type: CASE_EVENT_TYPES.installmentActivated,
-          note: "Debtor explicitly accepted the standard installment plan.",
+          note: "Debtor explicitly accepted the proposed installment plan.",
           payload: {
             communicationId: communication.id,
             planId: plan.id,
@@ -901,6 +911,12 @@ async function applyReplyDecision(input: {
               "Odpoveď bola priradená k prípadu, ale odosielateľ sa nezhoduje s uloženým emailom dlžníka. Skontrolujte ju pred pokračovaním.",
             idempotencyKey: `sender-mismatch-customer:${communication.id}`
           }
+        : decision.reason === "NON_STANDARD_INSTALLMENT_TERMS"
+          ? {
+              reason:
+                "Dlžník navrhol iný splátkový kalendár alebo zmenil už navrhnutý plán. Automatizácia ho bez vášho pokynu neschvaľuje.",
+              idempotencyKey: `non-standard-installment-customer:${communication.id}`
+            }
         : {
             reason:
               "Dlžník navrhol inú alebo čiastočnú sumu/podmienky. Automatizácia nemení výšku dlhu ani neakceptuje neštandardné podmienky bez vášho pokynu.",
@@ -988,7 +1004,9 @@ async function classifyInboundCommunication(
   const raw = jsonRecord(communication.rawPayload);
   const automated = isAutomatedRawEmail(raw);
   const messageText =
-    communication.textBody?.trim() || stripHtml(communication.htmlBody);
+    stripQuotedReply(
+      communication.textBody?.trim() || stripHtml(communication.htmlBody)
+    );
   let classification: DebtorReplyClassification;
   try {
     classification = automated
@@ -997,6 +1015,7 @@ async function classifyInboundCommunication(
           promisedPaymentDate: null,
           installmentRequested: false,
           explicitInstallmentAcceptance: false,
+          requestedInstallmentCount: null,
           mentionedPaymentAmount: null,
           summary: "Automated email response.",
           confidence: 1,
@@ -1013,6 +1032,7 @@ async function classifyInboundCommunication(
             promisedPaymentDate: null,
             installmentRequested: false,
             explicitInstallmentAcceptance: false,
+            requestedInstallmentCount: null,
             mentionedPaymentAmount: null,
             summary: "Inbound reply has no readable text body.",
             confidence: 1,
@@ -1247,9 +1267,16 @@ async function sendCustomerNotice(
 ): Promise<void> {
   const collectionCase = await prisma.case.findFirstOrThrow({
     where: { id: caseId, organizationId },
-    select: {
-      invoiceNumber: true,
-      confirmedByUserId: true
+    include: {
+      debtor: true,
+      customer: true,
+      organization: true,
+      installmentPlans: {
+        where: { status: { in: ["PROPOSED", "ACTIVE"] } },
+        orderBy: { createdAt: "desc" },
+        take: 1,
+        include: { payments: { orderBy: { sequence: "asc" } } }
+      }
     }
   });
   const recipient = await getCustomerCheckRecipient(
@@ -1272,11 +1299,47 @@ async function sendCustomerNotice(
       invoiceNumber: collectionCase.invoiceNumber ?? caseId,
       title,
       summary,
-      caseUrl: `${publicUrl}/?case=${caseId}`
+      caseUrl: `${publicUrl}/?case=${caseId}`,
+      statusLine: customerNoticeStatusLine(collectionCase),
+      invoiceData: invoiceSummaryFromCase(collectionCase),
+      installmentSchedule: installmentScheduleFromPlan(collectionCase.installmentPlans[0] ?? null),
+      installmentCurrency: collectionCase.installmentPlans[0]?.currency ?? collectionCase.currency ?? "EUR"
     }),
     metadata: { caseId, organizationId, kind: "customer-notice" },
     rawPayload: { kind: "customer-notice", title, replyTo }
   });
+}
+
+function customerNoticeStatusLine(collectionCase: {
+  status: string;
+  automationPausedAt: Date | null;
+  automationPauseReason: string | null;
+  nextActionAt: Date | null;
+}): string {
+  if (collectionCase.automationPausedAt) {
+    return collectionCase.automationPauseReason
+      ? `Automatický postup je pozastavený: ${collectionCase.automationPauseReason}.`
+      : "Automatický postup je pozastavený.";
+  }
+  if (collectionCase.status === "INSTALLMENT_ACTIVE") {
+    const next = isoDate(collectionCase.nextActionAt);
+    return next
+      ? `Splátkový kalendár je aktívny. Najbližšia kontrola splátky je naplánovaná na ${next}.`
+      : "Splátkový kalendár je aktívny.";
+  }
+  if (collectionCase.status === "CLOSED_PAID") {
+    return "Prípad je uzavretý ako uhradený.";
+  }
+  if (collectionCase.status === "CLOSED_CANCELLED") {
+    return "Prípad je zastavený.";
+  }
+  if (collectionCase.status === "CLOSED_UNRESOLVED") {
+    return "Prípad je uzavretý bez vyriešenia.";
+  }
+  const next = isoDate(collectionCase.nextActionAt);
+  return next
+    ? `Automatický postup pokračuje. Ďalší krok je naplánovaný na ${next}.`
+    : "Automatický postup pokračuje podľa aktuálneho stavu prípadu.";
 }
 
 async function sendCustomerDebtorReplyDecisionRequest(
@@ -1285,6 +1348,7 @@ async function sendCustomerDebtorReplyDecisionRequest(
     id: string;
     textBody: string | null;
     htmlBody: string | null;
+    aiClassification?: Prisma.JsonValue | null;
   },
   reason: string,
   idempotencyKey: string
@@ -1300,21 +1364,34 @@ async function sendCustomerDebtorReplyDecisionRequest(
     process.env.NEXTAUTH_URL || process.env.APP_URL || "http://localhost:3000";
   const replyTo = caseClarificationAddress(collectionCase.id);
   const debtorMessage = truncateForCustomerEmail(
-    communication.textBody?.trim() || stripHtml(communication.htmlBody)
+    stripQuotedReply(communication.textBody?.trim() || stripHtml(communication.htmlBody))
   );
+  const fallbackTemplate = buildCustomerDebtorReplyDecisionRequest({
+    invoiceNumber: collectionCase.invoiceNumber ?? collectionCase.id,
+    debtorName: collectionCase.debtor?.name ?? null,
+    debtorMessage,
+    reason,
+    caseUrl: `${publicUrl}/?case=${collectionCase.id}`,
+    invoiceData: invoiceSummaryFromCase(collectionCase),
+    installmentSchedule: installmentScheduleFromPlan(collectionCase.installmentPlans[0] ?? null),
+    installmentCurrency: collectionCase.installmentPlans[0]?.currency ?? collectionCase.currency ?? "EUR"
+  });
+  const template = await buildCustomerDecisionRequestTemplate({
+    collectionCase,
+    debtorMessage,
+    reason,
+    caseUrl: `${publicUrl}/?case=${collectionCase.id}`,
+    replyTo,
+    classificationSummary: classificationSummaryFromJson(communication.aiClassification),
+    fallbackTemplate
+  });
   await sendTrackedEmail({
     caseId: collectionCase.id,
     idempotencyKey,
     fromAddress: outboundFromAddress(),
     toAddress: recipient,
     replyTo,
-    template: buildCustomerDebtorReplyDecisionRequest({
-      invoiceNumber: collectionCase.invoiceNumber ?? collectionCase.id,
-      debtorName: collectionCase.debtor?.name ?? null,
-      debtorMessage,
-      reason,
-      caseUrl: `${publicUrl}/?case=${collectionCase.id}`
-    }),
+    template,
     metadata: {
       caseId: collectionCase.id,
       organizationId: collectionCase.organizationId,
@@ -1324,9 +1401,55 @@ async function sendCustomerDebtorReplyDecisionRequest(
       kind: "customer-debtor-reply-decision",
       replyTo,
       sourceCommunicationId: communication.id,
-      reason
+      reason,
+      assistantDrafted: template !== fallbackTemplate
     }
   });
+}
+
+async function buildCustomerDecisionRequestTemplate(input: {
+  collectionCase: CollectionCase;
+  debtorMessage: string | null;
+  reason: string;
+  caseUrl: string;
+  replyTo: string;
+  classificationSummary: string | null;
+  fallbackTemplate: CollectionTemplate;
+}): Promise<CollectionTemplate> {
+  const { collectionCase } = input;
+  try {
+    const draft = await createAiProvider().draftCustomerDecisionEmail({
+      organizationId: collectionCase.organizationId,
+      caseId: collectionCase.id,
+      invoiceNumber: collectionCase.invoiceNumber ?? collectionCase.id,
+      debtorName: collectionCase.debtor?.name ?? null,
+      amountTotal: decimalNumber(collectionCase.amountTotal),
+      currency: collectionCase.currency,
+      dueDate: isoDate(collectionCase.dueDate),
+      debtorMessage: input.debtorMessage,
+      decisionReason: input.reason,
+      classificationSummary: input.classificationSummary,
+      caseUrl: input.caseUrl,
+      replyToAddress: input.replyTo,
+      allowedReplies: [
+        "pošlite dlžníkovi štandardný splátkový kalendár",
+        "pošlite mu doplňujúcu správu: ...",
+        "pošlite schválenú poslednú výzvu",
+        "pokračujte štandardným spôsobom",
+        "pozastavte prípad",
+        "označte prípad ako uhradený"
+      ]
+    });
+    return buildCustomerDebtorReplyDecisionAssistantRequest({
+      subject: draft.subject,
+      textBody: draft.textBody,
+      invoiceData: invoiceSummaryFromCase(collectionCase),
+      installmentSchedule: installmentScheduleFromPlan(collectionCase.installmentPlans[0] ?? null),
+      installmentCurrency: collectionCase.installmentPlans[0]?.currency ?? collectionCase.currency ?? "EUR"
+    });
+  } catch {
+    return input.fallbackTemplate;
+  }
 }
 
 async function recordReplyAction(
@@ -1410,33 +1533,117 @@ function buildPaymentCheckTemplate(input: {
   installmentSequence: number | null;
   paidUrl: string;
   notPaidUrl: string;
+  invoiceData: InvoiceEmailSummary;
+  installmentSchedule: InstallmentScheduleRow[] | null;
+  installmentCurrency: string;
 }): CollectionTemplate {
   const subject = input.installmentSequence
     ? `FAKTURIO: prišla ${input.installmentSequence}. splátka?`
     : `FAKTURIO: prišla úhrada faktúry ${input.invoiceNumber}?`;
   const amount = input.amount === null
     ? "nezistená suma"
-    : `${input.amount.toFixed(2)} ${input.currency}`;
+    : formatEmailMoney(input.amount, input.currency);
+  const dueDate = formatEmailDate(input.dueDate);
   const label = input.installmentSequence
     ? `${input.installmentSequence}. splátka`
     : `faktúra ${input.invoiceNumber}`;
   const textBody = [
     "Dobrý deň,",
     "",
-    `${label} pre ${input.debtorName} mala termín ${input.dueDate}.`,
+    `${label} pre ${input.debtorName} mala termín ${dueDate}.`,
     `Očakávaná suma: ${amount}.`,
+    "",
+    "Údaje z faktúry:",
+    ...paymentCheckInvoiceLines(input.invoiceData),
+    ...(input.installmentSchedule?.length
+      ? ["", "Splátkový kalendár:", ...input.installmentSchedule.map((payment) =>
+          `${payment.sequence}. splátka: ${formatEmailMoney(payment.amount, input.installmentCurrency)}, splatná ${formatEmailDate(payment.dueDate)}`
+        )]
+      : []),
     "",
     `Platba prišla: ${input.paidUrl}`,
     `Platba neprišla: ${input.notPaidUrl}`
   ].join("\n");
   const htmlBody = [
     "<p>Dobrý deň,</p>",
-    `<p>${escapeHtml(label)} pre <strong>${escapeHtml(input.debtorName)}</strong> mala termín ${escapeHtml(input.dueDate)}.</p>`,
+    `<p>${escapeHtml(label)} pre <strong>${escapeHtml(input.debtorName)}</strong> mala termín ${escapeHtml(dueDate)}.</p>`,
     `<p>Očakávaná suma: <strong>${escapeHtml(amount)}</strong></p>`,
+    renderPaymentCheckInvoiceTable(input.invoiceData),
+    input.installmentSchedule?.length
+      ? renderPaymentCheckInstallmentTable(input.installmentSchedule, input.installmentCurrency)
+      : "",
     `<p><a href="${escapeHtml(input.paidUrl)}">Platba prišla</a></p>`,
     `<p><a href="${escapeHtml(input.notPaidUrl)}">Platba neprišla</a></p>`
   ].join("");
-  return { subject, textBody, htmlBody };
+  return {
+    subject,
+    textBody,
+    htmlBody: renderEmailDocument({
+      title: subject,
+      preheader: `${label} pre ${input.debtorName}: čakáme na potvrdenie platby.`,
+      bodyHtml: htmlBody
+    })
+  };
+}
+
+function paymentCheckInvoiceLines(input: InvoiceEmailSummary): string[] {
+  const amount =
+    input.amountTotal === null || input.amountTotal === undefined
+      ? "nezadaná"
+      : formatEmailMoney(input.amountTotal, input.currency);
+  return [
+    `- Faktúra: ${input.invoiceNumber || "nezadaná"}`,
+    `- Dodávateľ: ${input.supplierName || "nezadaný"}`,
+    `- Odberateľ: ${input.debtorName || "nezadaný"}`,
+    `- Suma: ${amount}`,
+    `- Splatnosť: ${input.dueDate ? formatEmailDate(input.dueDate) : "nezadaná"}`,
+    `- IBAN: ${input.iban || "nezadaný"}`,
+    `- Variabilný symbol: ${input.variableSymbol || "nezadaný"}`
+  ];
+}
+
+function renderPaymentCheckInvoiceTable(input: InvoiceEmailSummary): string {
+  const amount =
+    input.amountTotal === null || input.amountTotal === undefined
+      ? "nezadaná"
+      : formatEmailMoney(input.amountTotal, input.currency);
+  const rows = [
+    ["Faktúra", input.invoiceNumber || "nezadaná"],
+    ["Dodávateľ", input.supplierName || "nezadaný"],
+    ["Odberateľ", input.debtorName || "nezadaný"],
+    ["Suma", amount],
+    ["Splatnosť", input.dueDate ? formatEmailDate(input.dueDate) : "nezadaná"],
+    ["IBAN", input.iban || "nezadaný"],
+    ["Variabilný symbol", input.variableSymbol || "nezadaný"]
+  ];
+  return [
+    '<div style="margin:18px 0">',
+    '<p style="margin:0 0 8px;font-weight:700">Údaje z faktúry</p>',
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px">',
+    ...rows.map(([label, value]) =>
+      `<tr><td style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;width:38%">${escapeHtml(label)}</td><td style="border:1px solid #d9ddd5;padding:8px 10px;color:#1d1d1b;font-weight:700">${escapeHtml(value)}</td></tr>`
+    ),
+    "</table>",
+    "</div>"
+  ].join("");
+}
+
+function renderPaymentCheckInstallmentTable(
+  payments: InstallmentScheduleRow[],
+  currency: string
+): string {
+  const rows = payments.map((payment) =>
+    `<tr><td style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661">${payment.sequence}. splátka</td><td style="border:1px solid #d9ddd5;padding:8px 10px;color:#1d1d1b;font-weight:700">${escapeHtml(formatEmailMoney(payment.amount, currency))}</td><td style="border:1px solid #d9ddd5;padding:8px 10px;color:#1d1d1b;font-weight:700">${escapeHtml(formatEmailDate(payment.dueDate))}</td></tr>`
+  );
+  return [
+    '<div style="margin:18px 0">',
+    '<p style="margin:0 0 8px;font-weight:700">Splátkový kalendár</p>',
+    '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px">',
+    '<tr><th align="left" style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;background:#f6f7f4">Splátka</th><th align="left" style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;background:#f6f7f4">Suma</th><th align="left" style="border:1px solid #d9ddd5;padding:8px 10px;color:#5d6661;background:#f6f7f4">Splatnosť</th></tr>',
+    ...rows,
+    "</table>",
+    "</div>"
+  ].join("");
 }
 
 type CommunicationDraftData = {
@@ -1846,11 +2053,49 @@ function installmentTemplateRow(payment: {
   sequence: number;
   amount: Prisma.Decimal | number;
   dueDate: Date;
-}) {
+}): InstallmentScheduleRow {
   return {
     sequence: payment.sequence,
     amount: Number(payment.amount),
     dueDate: isoDate(payment.dueDate)!
+  };
+}
+
+function installmentScheduleFromPlan(plan: {
+  currency: string;
+  payments: Array<{ sequence: number; amount: Prisma.Decimal | number; dueDate: Date }>;
+} | null): InstallmentScheduleRow[] | null {
+  if (!plan) {
+    return null;
+  }
+  return plan.payments.map(installmentTemplateRow);
+}
+
+function invoiceSummaryFromCase(collectionCase: {
+  invoiceNumber: string | null;
+  supplierSnapshot: Prisma.JsonValue | null;
+  paymentSnapshot: Prisma.JsonValue | null;
+  amountTotal: Prisma.Decimal | number | null;
+  currency: string | null;
+  dueDate: Date | null;
+  debtor: { name: string | null } | null;
+  customer: { name: string | null } | null;
+}): InvoiceEmailSummary {
+  const supplier = jsonRecord(collectionCase.supplierSnapshot);
+  const payment = jsonRecord(collectionCase.paymentSnapshot);
+  return {
+    invoiceNumber: collectionCase.invoiceNumber,
+    supplierName:
+      collectionCase.customer?.name ?? stringValue(supplier.name) ?? null,
+    debtorName: collectionCase.debtor?.name ?? null,
+    amountTotal:
+      collectionCase.amountTotal === null
+        ? null
+        : Number(collectionCase.amountTotal),
+    currency: collectionCase.currency,
+    dueDate: isoDate(collectionCase.dueDate),
+    iban: stringValue(payment.iban),
+    variableSymbol: stringValue(payment.variableSymbol)
   };
 }
 
@@ -1947,6 +2192,10 @@ function jsonRecord(value: Prisma.JsonValue | null): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function classificationSummaryFromJson(value: Prisma.JsonValue | null | undefined): string | null {
+  return stringValue(jsonRecord(value ?? null).summary);
 }
 
 function stringValue(value: unknown): string | null {

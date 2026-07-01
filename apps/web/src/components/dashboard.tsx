@@ -149,6 +149,12 @@ type AssistantReplyState = {
   subject: string | null;
   textBody: string;
 };
+type AssistantChatMessage = AssistantReplyState & {
+  id: string;
+  role: "user" | "assistant" | "system";
+  createdAt: string;
+  pending?: boolean;
+};
 
 export function Dashboard({
   initialCases,
@@ -190,9 +196,9 @@ export function Dashboard({
   );
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const [assistantDraft, setAssistantDraft] = useState("");
-  const [assistantReply, setAssistantReply] = useState<AssistantReplyState | null>(
-    null
-  );
+  const [assistantThreads, setAssistantThreads] = useState<
+    Record<string, AssistantChatMessage[]>
+  >({});
   const [assistantPending, setAssistantPending] = useState(false);
 
   const filteredCases = useMemo(
@@ -207,6 +213,7 @@ export function Dashboard({
     () => cases.find((item) => item.id === selectedId) ?? cases[0] ?? null,
     [cases, selectedId]
   );
+  const selectedCaseId = selected?.id ?? null;
   const counts = useMemo(() => summarizeCases(cases), [cases]);
   const debtorCounts = useMemo(() => summarizeDebtors(debtors), [debtors]);
   const selectedDebtor = useMemo(
@@ -222,11 +229,18 @@ export function Dashboard({
     setReviewForm(toReviewForm(selected));
     setContactEmail(selected?.debtorEmail ?? "");
     setReviewDirty(false);
+  }, [selected]);
+
+  useEffect(() => {
     setValidationErrors([]);
     setAssistantDraft("");
-    setAssistantReply(null);
     setDetailTab("OVERVIEW");
-  }, [selected]);
+  }, [selectedCaseId]);
+
+  const assistantMessages = useMemo(
+    () => (selectedCaseId ? assistantThreads[selectedCaseId] ?? [] : []),
+    [assistantThreads, selectedCaseId]
+  );
 
   useEffect(() => {
     if (!reviewDirty) {
@@ -585,22 +599,48 @@ export function Dashboard({
       notify("error", "Napíšte pokyn pre asistenta.");
       return;
     }
+    const caseId = selected.id;
+    const userMessage: AssistantChatMessage = {
+      id: `user-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      role: "user",
+      intent: null,
+      subject: "Vy",
+      textBody: message,
+      createdAt: new Date().toISOString()
+    };
+    const pendingMessage: AssistantChatMessage = {
+      id: `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      role: "assistant",
+      intent: null,
+      subject: "Asistent spracúva pokyn",
+      textBody: "Čítam prípad, vyhodnocujem pokyn a pripravujem odpoveď.",
+      createdAt: new Date().toISOString(),
+      pending: true
+    };
+    appendAssistantMessages(caseId, [userMessage, pendingMessage]);
+    setAssistantDraft("");
     setAssistantPending(true);
     clearToast();
     try {
-      const response = await fetch(`/api/cases/${selected.id}/assistant`, {
+      const response = await fetch(`/api/cases/${caseId}/assistant`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message })
       });
       const payload = await readApiPayload(response);
       if (!response.ok) {
+        replaceAssistantPending(caseId, pendingMessage.id, {
+          role: "system",
+          subject: "Pokyn sa nepodarilo spracovať",
+          textBody: payload.error ?? "Asistent nedokázal spracovať pokyn.",
+          intent: null
+        });
         notify("error", payload.error ?? "Asistent nedokázal spracovať pokyn.");
         return;
       }
       replaceCase(payload.case);
-      setAssistantDraft("");
-      setAssistantReply({
+      replaceAssistantPending(caseId, pendingMessage.id, {
+        role: "assistant",
         intent: payload.assistant?.intent ?? null,
         subject: payload.assistant?.reply?.subject ?? null,
         textBody:
@@ -609,10 +649,43 @@ export function Dashboard({
       });
       notify("success", "Asistent spracoval pokyn.");
     } catch {
+      replaceAssistantPending(caseId, pendingMessage.id, {
+        role: "system",
+        subject: "Chyba spojenia",
+        textBody: "Asistent nedokázal spracovať pokyn. Skontrolujte pripojenie.",
+        intent: null
+      });
       notify("error", "Asistent nedokázal spracovať pokyn. Skontrolujte pripojenie.");
     } finally {
       setAssistantPending(false);
     }
+  }
+
+  function appendAssistantMessages(caseId: string, messages: AssistantChatMessage[]) {
+    setAssistantThreads((current) => ({
+      ...current,
+      [caseId]: [...(current[caseId] ?? []), ...messages]
+    }));
+  }
+
+  function replaceAssistantPending(
+    caseId: string,
+    messageId: string,
+    replacement: Omit<AssistantChatMessage, "id" | "createdAt" | "pending">
+  ) {
+    setAssistantThreads((current) => ({
+      ...current,
+      [caseId]: (current[caseId] ?? []).map((item) =>
+        item.id === messageId
+          ? {
+              ...item,
+              ...replacement,
+              pending: false,
+              createdAt: new Date().toISOString()
+            }
+          : item
+      )
+    }));
   }
 
   function notify(kind: ToastKind, text: string) {
@@ -820,7 +893,7 @@ export function Dashboard({
                   <AssistantPanel
                     item={selected}
                     draft={assistantDraft}
-                    reply={assistantReply}
+                    messages={assistantMessages}
                     pending={assistantPending}
                     onDraftChange={setAssistantDraft}
                     onSubmit={() => sendAssistantMessage()}
@@ -2026,7 +2099,7 @@ function CommunicationsPanel({
 function AssistantPanel({
   item,
   draft,
-  reply,
+  messages,
   pending,
   onDraftChange,
   onSubmit,
@@ -2034,12 +2107,13 @@ function AssistantPanel({
 }: {
   item: DashboardCase;
   draft: string;
-  reply: AssistantReplyState | null;
+  messages: AssistantChatMessage[];
   pending: boolean;
   onDraftChange: (value: string) => void;
   onSubmit: () => void;
   onQuickCommand: (message: string) => void;
 }) {
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const quickActions = [
     {
       label: "História prípadu",
@@ -2064,6 +2138,13 @@ function AssistantPanel({
     }
   ];
   const canUseDebtorActions = Boolean(item.debtorEmail);
+
+  useEffect(() => {
+    transcriptRef.current?.scrollTo({
+      top: transcriptRef.current.scrollHeight,
+      behavior: "smooth"
+    });
+  }, [messages]);
 
   return (
     <div className="mx-auto max-w-4xl px-6 py-6">
@@ -2098,13 +2179,47 @@ function AssistantPanel({
         </div>
       ) : null}
 
-      <div className="mt-5 border border-zincLine bg-white">
+      <section className="mt-5 border border-zincLine bg-white">
+        <div className="border-b border-zincLine bg-[#fafaf8] px-4 py-3">
+          <div className="text-sm font-semibold">Dialóg s asistentom</div>
+          <div className="mt-1 text-xs text-steel">
+            Píšte pokyny prirodzene. Asistent odpovie, čo vykonal, čo nevykonal
+            a čo potrebuje potvrdiť.
+          </div>
+        </div>
+        <div
+          ref={transcriptRef}
+          className="max-h-[460px] min-h-[280px] space-y-4 overflow-y-auto px-4 py-4"
+          aria-live="polite"
+        >
+          {messages.length > 0 ? (
+            messages.map((message) => (
+              <AssistantChatBubble key={message.id} message={message} />
+            ))
+          ) : (
+            <div className="flex min-h-[220px] items-center justify-center border border-dashed border-zincLine bg-[#fafaf8] p-6 text-center">
+              <div>
+                <Mail className="mx-auto h-6 w-6 text-steel" />
+                <div className="mt-3 text-sm font-semibold">
+                  Pripravený na dialóg
+                </div>
+                <p className="mt-2 max-w-md text-sm leading-6 text-steel">
+                  Použite rýchlu akciu alebo napíšte vlastný pokyn. Odpoveď
+                  asistenta sa zobrazí v tejto konverzácii.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <div className="border-x border-b border-zincLine bg-white">
         <label className="block p-4">
           <span className="text-sm font-semibold">Pokyn pre asistenta</span>
           <textarea
             value={draft}
             onChange={(event) => onDraftChange(event.target.value)}
-            rows={7}
+            rows={4}
             maxLength={4000}
             placeholder="Napríklad: Navrhni dlžníkovi prvú platbu 500 EUR a zvyšok v 3 rovnakých splátkach. Alebo: Čo sa v tomto prípade stalo?"
             className="mt-3 w-full resize-y border border-zincLine px-3 py-2 text-sm leading-6 outline-none focus:border-ink"
@@ -2124,33 +2239,79 @@ function AssistantPanel({
           </button>
         </div>
       </div>
-
-      {reply ? (
-        <article className="mt-5 border border-zincLine bg-[#fafaf8] p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold">
-                {reply.subject ?? "Odpoveď asistenta"}
-              </div>
-              {reply.intent ? (
-                <div className="mt-1 text-xs text-steel">{reply.intent}</div>
-              ) : null}
-            </div>
-            <StatusBadge status={item.status} />
-          </div>
-          <p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-[#33413b]">
-            {reply.textBody}
-          </p>
-        </article>
-      ) : (
-        <EmptyPanel
-          icon={Mail}
-          title="Pripravený na pokyn"
-          text="Použite rýchlu akciu alebo napíšte vlastný pokyn k vybranému prípadu."
-        />
-      )}
     </div>
   );
+}
+
+function AssistantChatBubble({ message }: { message: AssistantChatMessage }) {
+  const isUser = message.role === "user";
+  const isSystem = message.role === "system";
+  const intentLabel = assistantIntentLabel(message.intent);
+  return (
+    <article
+      className={[
+        "flex",
+        isUser ? "justify-end" : "justify-start"
+      ].join(" ")}
+    >
+      <div
+        className={[
+          "max-w-[82%] border px-4 py-3 text-sm shadow-sm",
+          isUser
+            ? "border-[#0c4f4a] bg-[#0b3f3b] text-white"
+            : isSystem
+              ? "border-[#e2bd78] bg-[#fff9ed] text-[#6f4b15]"
+              : "border-zincLine bg-[#fafaf8] text-[#25332e]"
+        ].join(" ")}
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-semibold">
+            {isUser ? "Vy" : isSystem ? "Systém" : message.subject ?? "Asistent"}
+          </span>
+          {intentLabel && !isUser ? (
+            <span className="border border-zincLine bg-white/70 px-2 py-0.5 text-[11px] text-steel">
+              {intentLabel}
+            </span>
+          ) : null}
+          {message.pending ? (
+            <span className="text-xs text-steel">spracúva sa</span>
+          ) : null}
+        </div>
+        <p className="mt-2 whitespace-pre-wrap leading-6">{message.textBody}</p>
+        <time
+          dateTime={message.createdAt}
+          className={["mt-2 block text-[11px]", isUser ? "text-white/70" : "text-steel"].join(" ")}
+        >
+          {formatDateTime(message.createdAt)}
+        </time>
+      </div>
+    </article>
+  );
+}
+
+function assistantIntentLabel(intent: string | null): string | null {
+  if (!intent || intent === "OTHER") {
+    return null;
+  }
+  const labels: Record<string, string> = {
+    PROVIDE_INVOICE_FIELDS: "doplnené údaje",
+    ADD_CASE_NOTE: "poznámka",
+    ASK_CASE_STATUS: "stav prípadu",
+    ASK_MISSING_FIELDS: "chýbajúce údaje",
+    UPDATE_DEBTOR_CONTACT: "kontakt dlžníka",
+    REQUEST_PAUSE: "pauza",
+    REQUEST_RESUME: "obnovenie",
+    REQUEST_MARK_PAID: "úhrada",
+    REQUEST_CANCEL: "zastavenie",
+    REQUEST_CONFIRM_INVOICE: "spustenie",
+    REQUEST_STANDARD_INSTALLMENT_PLAN: "štandardné splátky",
+    REQUEST_CUSTOM_INSTALLMENT_PLAN: "splátky",
+    REQUEST_SEND_DEBTOR_MESSAGE: "správa dlžníkovi",
+    REQUEST_FINAL_NOTICE: "posledná výzva",
+    ASK_CASE_HISTORY: "história prípadu",
+    UNSAFE_OR_LEGAL: "vyžaduje kontrolu"
+  };
+  return labels[intent] ?? "pokyn";
 }
 
 function InstallmentPlanSection({

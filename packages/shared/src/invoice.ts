@@ -92,6 +92,7 @@ export const debtorReplyClassificationSchema = z.object({
   promisedPaymentDate: nullableText,
   installmentRequested: z.boolean(),
   explicitInstallmentAcceptance: z.boolean().default(false),
+  requestedInstallmentCount: z.number().int().positive().nullable().default(null),
   mentionedPaymentAmount: z.number().positive().nullable().default(null),
   summary: z.string(),
   confidence: z.number().min(0).max(1),

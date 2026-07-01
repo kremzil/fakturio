@@ -1,4 +1,9 @@
 import type { CustomerMessageClassification } from "./customer-message";
+import type {
+  CustomerDecisionEmailDraft,
+  CustomerDecisionEmailInput
+} from "./customer-decision-email";
+import type { DashboardCaseAssistantInput, DashboardCaseAssistantReply } from "./case-assistant";
 import type { DebtorReplyClassification, InvoiceExtractionResult } from "./invoice";
 import type {
   InvoiceEmailAttachmentRef,
@@ -78,6 +83,8 @@ export interface AiProvider {
   classifyInvoiceEmailAttachments(input: InvoiceEmailAttachmentTriageInput): Promise<InvoiceEmailAttachmentTriageResult>;
   classifyDebtorReply(input: DebtorReplyInput): Promise<DebtorReplyClassification>;
   classifyCustomerMessage(input: CustomerMessageInput): Promise<CustomerMessageClassification>;
+  answerDashboardCaseMessage(input: DashboardCaseAssistantInput): Promise<DashboardCaseAssistantReply>;
+  draftCustomerDecisionEmail(input: CustomerDecisionEmailInput): Promise<CustomerDecisionEmailDraft>;
   generateDebtorEmail(input: GenerateEmailInput): Promise<GeneratedEmail>;
   summarizeCase(input: CaseSummaryInput): Promise<CaseSummary>;
 }

@@ -41,6 +41,7 @@ describe("shared domain", () => {
   it("blocks unsupported direct legal action transitions", () => {
     expect(canTransitionCase("OVERDUE", "READY_FOR_LEGAL_ACTION")).toBe(false);
     expect(canTransitionCase("FINAL_NOTICE_SENT", "READY_FOR_LEGAL_ACTION")).toBe(true);
+    expect(canTransitionCase("FINAL_NOTICE_SENT", "INSTALLMENT_PLAN_SENT")).toBe(true);
     expect(canTransitionCase("INSTALLMENT_PLAN_SENT", "EMAIL_REMINDER_1_SENT")).toBe(true);
     expect(canTransitionCase("MANUAL_REVIEW_REQUIRED", "INSTALLMENT_PLAN_SENT")).toBe(true);
     expect(() =>
